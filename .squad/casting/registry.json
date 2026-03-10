@@ -1,0 +1,36 @@
+{
+  "agents": {
+    "gandalf": {
+      "persistent_name": "Gandalf",
+      "universe": "The Lord of the Rings",
+      "role": "Lead",
+      "created_at": "2026-03-10T04:58:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "frodo": {
+      "persistent_name": "Frodo",
+      "universe": "The Lord of the Rings",
+      "role": "Azure Expert",
+      "created_at": "2026-03-10T04:58:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "aragorn": {
+      "persistent_name": "Aragorn",
+      "universe": "The Lord of the Rings",
+      "role": "SQLite/C Dev",
+      "created_at": "2026-03-10T04:58:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "samwise": {
+      "persistent_name": "Samwise",
+      "universe": "The Lord of the Rings",
+      "role": "QA",
+      "created_at": "2026-03-10T04:58:00Z",
+      "legacy_named": false,
+      "status": "active"
+    }
+  }
+}

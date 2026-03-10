@@ -1,0 +1,23 @@
+{
+  "universe_usage_history": [
+    {
+      "universe": "The Lord of the Rings",
+      "first_used": "2026-03-10T04:58:00Z",
+      "last_used": "2026-03-10T04:58:00Z",
+      "repo": "sqlite"
+    }
+  ],
+  "assignment_cast_snapshots": {
+    "lotr-20260310": {
+      "assignment_id": "lotr-20260310",
+      "universe": "The Lord of the Rings",
+      "created_at": "2026-03-10T04:58:00Z",
+      "agents": {
+        "gandalf": "Lead",
+        "frodo": "Azure Expert",
+        "aragorn": "SQLite/C Dev",
+        "samwise": "QA"
+      }
+    }
+  }
+}
