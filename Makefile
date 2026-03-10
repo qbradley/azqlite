@@ -85,7 +85,8 @@ TEST_OBJS   = $(SQLITE_OBJ) $(BUILD_DIR)/azqlite_vfs.o $(BUILD_DIR)/azure_client
 
 # ---------- Default target ----------
 
-.PHONY: all all-production clean test test-unit test-integration amalgamation
+.PHONY: all all-production clean test test-unit test-integration amalgamation \
+       sanitize coverage
 
 all: $(LIBRARY) $(SHELL_BIN)
 
@@ -188,6 +189,42 @@ test: test-unit test-integration
 clean:
 	rm -rf $(BUILD_DIR)
 	rm -f $(SHELL_BIN)
+
+# ---------- Sanitizer build ----------
+# Build and run unit tests with AddressSanitizer + UndefinedBehaviorSanitizer.
+# Catches: buffer overflows, use-after-free, memory leaks, signed integer
+# overflow, null-pointer dereference, and other undefined behavior.
+
+SANITIZE_CFLAGS  = -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g \
+                   -fno-sanitize-recover=all
+SANITIZE_LDFLAGS = -fsanitize=address,undefined
+
+sanitize: clean
+	@echo "=== Building with AddressSanitizer + UBSan ==="
+	$(MAKE) test-unit \
+		CFLAGS="$(CFLAGS) $(SANITIZE_CFLAGS)" \
+		LDFLAGS="$(LDFLAGS) $(SANITIZE_LDFLAGS)"
+	@echo "=== Sanitizer tests passed ==="
+
+# ---------- Coverage build ----------
+# Build and run unit tests with code coverage instrumentation.
+# Produces an HTML report in $(BUILD_DIR)/coverage-report/.
+# Requires: gcov (ships with gcc), lcov, genhtml (install via package manager).
+
+coverage: clean
+	@echo "=== Building with coverage instrumentation ==="
+	$(MAKE) test-unit \
+		CFLAGS="$(CFLAGS) --coverage -O0 -g" \
+		LDFLAGS="$(LDFLAGS) --coverage"
+	@echo "=== Generating coverage report ==="
+	lcov --capture --directory $(BUILD_DIR) --output-file $(BUILD_DIR)/coverage.info \
+		--rc branch_coverage=1 --quiet
+	lcov --remove $(BUILD_DIR)/coverage.info '*/sqlite3.*' '*/test/*' \
+		--output-file $(BUILD_DIR)/coverage-filtered.info --rc branch_coverage=1 --quiet
+	genhtml $(BUILD_DIR)/coverage-filtered.info \
+		--output-directory $(BUILD_DIR)/coverage-report \
+		--rc branch_coverage=1 --quiet
+	@echo "=== Coverage report: $(BUILD_DIR)/coverage-report/index.html ==="
 
 # ---------- Amalgamation (future) ----------
 
