@@ -404,11 +404,18 @@ static int azqliteClose(sqlite3_file *pFile) {
         rc = azqliteSync(pFile, 0);
     }
 
-    /* Release lease if held */
+    /* Release lease if held.  Best-effort: lease auto-expires so we log
+    ** but don't fail xClose on release errors. */
     if (hasLease(p) && p->ops && p->ops->lease_release) {
         azure_error_t aerr;
         azure_error_init(&aerr);
-        p->ops->lease_release(p->ops_ctx, p->zBlobName, p->leaseId, &aerr);
+        azure_err_t larc = p->ops->lease_release(
+            p->ops_ctx, p->zBlobName, p->leaseId, &aerr);
+        if (larc != AZURE_OK) {
+            fprintf(stderr, "azqlite: lease_release failed (code=%d, blob=%s): %s\n",
+                    larc, p->zBlobName ? p->zBlobName : "(null)",
+                    aerr.error_message);
+        }
         p->leaseId[0] = '\0';
     }
 
@@ -711,30 +718,45 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
                     return SQLITE_IOERR_FSYNC;
                 }
             }
-            /* Upload entire WAL buffer */
+            /* Upload entire WAL buffer in chunks to respect 4 MiB limit */
             if (p->nWalData > 0) {
-                azure_error_init(&aerr);
-                azure_err_t arc = p->ops->append_blob_append(
-                    p->ops_ctx, p->zBlobName,
-                    p->aWalData, (int)p->nWalData,
-                    NULL, &aerr);
-                if (arc != AZURE_OK) {
-                    return SQLITE_IOERR_FSYNC;
+                sqlite3_int64 off = 0;
+                while (off < p->nWalData) {
+                    int chunk = (int)((p->nWalData - off > AZURE_MAX_APPEND_SIZE)
+                                      ? AZURE_MAX_APPEND_SIZE : (p->nWalData - off));
+                    azure_error_init(&aerr);
+                    azure_err_t arc = p->ops->append_blob_append(
+                        p->ops_ctx, p->zBlobName,
+                        p->aWalData + off, chunk,
+                        NULL, &aerr);
+                    azure_error_clear(&aerr);
+                    if (arc != AZURE_OK) {
+                        return SQLITE_IOERR_FSYNC;
+                    }
+                    off += chunk;
                 }
             }
             p->nWalSynced = p->nWalData;
             p->walNeedFullResync = 0;
         } else {
-            /* Incremental append — send only new data since last sync */
+            /* Incremental append — send only new data since last sync,
+            ** chunked to respect 4 MiB limit */
             sqlite3_int64 pending = p->nWalData - p->nWalSynced;
             if (pending > 0) {
-                azure_error_init(&aerr);
-                azure_err_t arc = p->ops->append_blob_append(
-                    p->ops_ctx, p->zBlobName,
-                    p->aWalData + p->nWalSynced, (int)pending,
-                    NULL, &aerr);
-                if (arc != AZURE_OK) {
-                    return SQLITE_IOERR_FSYNC;
+                sqlite3_int64 off = 0;
+                while (off < pending) {
+                    int chunk = (int)((pending - off > AZURE_MAX_APPEND_SIZE)
+                                      ? AZURE_MAX_APPEND_SIZE : (pending - off));
+                    azure_error_init(&aerr);
+                    azure_err_t arc = p->ops->append_blob_append(
+                        p->ops_ctx, p->zBlobName,
+                        p->aWalData + p->nWalSynced + off, chunk,
+                        NULL, &aerr);
+                    azure_error_clear(&aerr);
+                    if (arc != AZURE_OK) {
+                        return SQLITE_IOERR_FSYNC;
+                    }
+                    off += chunk;
                 }
                 p->nWalSynced = p->nWalData;
             }
@@ -1419,7 +1441,16 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                     p->zBlobName = NULL;
                     return rc;
                 }
+            } else if (arc != AZURE_OK) {
+                /* Download failed (transient network error etc.) —
+                ** do NOT proceed without WAL replay or committed
+                ** transactions will be silently lost. */
+                free(buf.data);
+                free(p->zBlobName);
+                p->zBlobName = NULL;
+                return azureErrToSqlite(arc, SQLITE_CANTOPEN);
             } else {
+                /* Download succeeded but WAL is empty — safe to proceed */
                 free(buf.data);
             }
         } else if (!walExists) {

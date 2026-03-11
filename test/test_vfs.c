@@ -1675,7 +1675,7 @@ TEST(vfs_pragma_journal_mode_delete) {
     close_test_db(db);
 }
 
-TEST(vfs_pragma_wal_refused) {
+TEST(vfs_pragma_wal_allowed) {
     setup();
     sqlite3 *db = open_test_db(g_ctx);
 
@@ -1683,8 +1683,8 @@ TEST(vfs_pragma_wal_refused) {
     sqlite3_prepare_v2(db, "PRAGMA journal_mode=WAL;", -1, &stmt, NULL);
     sqlite3_step(stmt);
     const char *mode = (const char *)sqlite3_column_text(stmt, 0);
-    /* WAL should be refused — mode stays DELETE (D2) */
-    ASSERT_STR_NE(mode, "wal");
+    /* WAL should be allowed — mock has append blob ops */
+    ASSERT_STR_EQ(mode, "wal");
     sqlite3_finalize(stmt);
 
     close_test_db(db);
@@ -1995,6 +1995,13 @@ TEST(vfs_sync_resize_failure_before_flush) {
 
 TEST(vfs_wal_mode_returns_delete) {
     setup();
+
+    /* Temporarily clear append blob ops to test rejection path */
+    azure_ops_t saved_ops = *g_ops;
+    g_ops->append_blob_create = NULL;
+    g_ops->append_blob_append = NULL;
+    g_ops->append_blob_delete = NULL;
+
     sqlite3 *db = open_test_db(g_ctx);
     ASSERT_NOT_NULL(db);
 
@@ -2002,11 +2009,14 @@ TEST(vfs_wal_mode_returns_delete) {
     sqlite3_prepare_v2(db, "PRAGMA journal_mode=WAL;", -1, &stmt, NULL);
     ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
     const char *mode = (const char *)sqlite3_column_text(stmt, 0);
-    /* WAL must be rejected — should stay as "delete" */
+    /* WAL must be rejected without append blob ops — stays "delete" */
     ASSERT_STR_EQ(mode, "delete");
     sqlite3_finalize(stmt);
 
     close_test_db(db);
+
+    /* Restore ops for subsequent tests */
+    *g_ops = saved_ops;
 }
 
 TEST(vfs_wal_mode_case_insensitive) {
@@ -2014,7 +2024,7 @@ TEST(vfs_wal_mode_case_insensitive) {
     sqlite3 *db = open_test_db(g_ctx);
     ASSERT_NOT_NULL(db);
 
-    /* Test case variants of WAL */
+    /* Test case variants of WAL — all should be accepted with append blob ops */
     const char *wal_variants[] = {"WAL", "wal", "Wal", NULL};
     for (int i = 0; wal_variants[i]; i++) {
         char sql[64];
@@ -2023,7 +2033,7 @@ TEST(vfs_wal_mode_case_insensitive) {
         sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
         sqlite3_step(stmt);
         const char *mode = (const char *)sqlite3_column_text(stmt, 0);
-        ASSERT_STR_NE(mode, "wal");
+        ASSERT_STR_EQ(mode, "wal");
         sqlite3_finalize(stmt);
     }
 
@@ -2484,7 +2494,7 @@ void run_vfs_tests(void) {
 
     TEST_SUITE_BEGIN("VFS PRAGMA");
     RUN_TEST(vfs_pragma_journal_mode_delete);
-    RUN_TEST(vfs_pragma_wal_refused);
+    RUN_TEST(vfs_pragma_wal_allowed);
     RUN_TEST(vfs_pragma_page_size_4096);
     TEST_SUITE_END();
 

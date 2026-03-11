@@ -122,6 +122,9 @@ typedef struct azure_page_range {
     size_t len;              /* Must be 512-byte aligned, max 4 MiB */
 } azure_page_range_t;
 
+/* Maximum bytes per append_blob_append call (Azure limit) */
+#define AZURE_MAX_APPEND_SIZE (4 * 1024 * 1024)
+
 #ifndef AZQLITE_MAX_PARALLEL_PUTS
 #define AZQLITE_MAX_PARALLEL_PUTS 32
 #endif
