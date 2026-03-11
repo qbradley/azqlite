@@ -92,6 +92,9 @@ static int azqliteDeviceCharacteristics(sqlite3_file*);
 
 /* ---------- Types ---------- */
 
+/* Forward declaration for back-pointer in azqliteFile */
+typedef struct azqliteVfsData azqliteVfsData;
+
 /*
 ** Per-file state for Azure-backed files.
 ** The first member MUST be pMethod (sqlite3_io_methods*) to satisfy
@@ -123,11 +126,17 @@ typedef struct azqliteFile {
     time_t leaseAcquiredAt;             /* For renewal timing */
     int leaseDuration;                  /* Actual lease duration acquired (seconds) */
 
+    /* R2: Skip redundant resize — track last synced blob size */
+    sqlite3_int64 lastSyncedSize;       /* Blob size after last successful resize/open */
+
     /* ETag tracking (preparation for MVP 2 cache invalidation) */
     char etag[128];                     /* Current blob ETag */
 
     /* File type */
     int eFileType;                      /* SQLITE_OPEN_MAIN_DB, etc. */
+
+    /* Back-pointer to VFS-level shared state */
+    azqliteVfsData *pVfsData;           /* VFS global data (for cache access) */
 
     /* For journal files (block blob) */
     unsigned char *aJrnlData;           /* Journal buffer */
@@ -138,13 +147,21 @@ typedef struct azqliteFile {
 /*
 ** Global VFS state — stored in sqlite3_vfs.pAppData.
 */
-typedef struct azqliteVfsData {
+struct azqliteVfsData {
     sqlite3_vfs *pDefaultVfs;           /* The platform default VFS */
     azure_ops_t *ops;                   /* Azure operations vtable */
     void *ops_ctx;                      /* Context for ops */
     azure_client_t *client;             /* Production client (may be NULL for tests) */
     char lastError[256];                /* Last error message for xGetLastError */
-} azqliteVfsData;
+
+    /* R1: Journal blob existence cache.
+    ** Since we are the single writer, we know when the journal blob exists
+    ** because we created (xSync) or deleted (xDelete) it ourselves.
+    ** This eliminates ~4 HEAD requests per transaction (~110ms saved).
+    **   -1 = unknown (do real HEAD), 0 = does not exist, 1 = exists */
+    int journalCacheState;
+    char journalBlobName[512];          /* Tracked journal blob name */
+};
 
 /* ---------- io_methods v1 ---------- */
 
@@ -486,6 +503,8 @@ static int azqliteTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
         if (arc != AZURE_OK) {
             return azureErrToSqlite(arc, SQLITE_IOERR_TRUNCATE);
         }
+        /* R2: Track the new Azure blob size after truncate */
+        p->lastSyncedSize = size;
     }
 
     if (size < p->nData) {
@@ -590,6 +609,9 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
             if (arc != AZURE_OK) {
                 return SQLITE_IOERR_FSYNC;
             }
+
+            /* R1: Journal blob now exists in Azure */
+            p->pVfsData->journalCacheState = 1;
         }
         return SQLITE_OK;
     }
@@ -608,9 +630,11 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
     int rc = leaseRenewIfNeeded(p);
     if (rc != SQLITE_OK) return SQLITE_IOERR_FSYNC;
 
-    /* If the blob needs to grow, resize first */
+    /* R2: Only resize if the blob has actually grown since last sync.
+    ** Most TPC-C transactions modify existing pages without growing the file,
+    ** so this skips a ~45ms HTTP round-trip per transaction. */
     double resize_ms = 0;
-    if (p->nData > 0 && p->ops->page_blob_resize) {
+    if (p->nData > p->lastSyncedSize && p->ops->page_blob_resize) {
         sqlite3_int64 alignedSize = (p->nData + 511) & ~(sqlite3_int64)511;
         double rt0 = 0;
         if (azqlite_debug_timing()) rt0 = azqlite_time_ms();
@@ -625,6 +649,7 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
         if (arc != AZURE_OK) {
             return SQLITE_IOERR_FSYNC;
         }
+        p->lastSyncedSize = p->nData;
     }
 
     /* Coalesce dirty pages into contiguous ranges */
@@ -984,6 +1009,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     /* Wire up Azure ops from VFS global state */
     p->ops = pVfsData->ops;
     p->ops_ctx = pVfsData->ops_ctx;
+    p->pVfsData = pVfsData;             /* R1: back-pointer for cache access */
     p->eFileType = flags & 0x0000FF00;  /* Extract type flags */
     p->eLock = SQLITE_LOCK_NONE;
     p->leaseId[0] = '\0';
@@ -1063,6 +1089,9 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
 
                 /* Re-ensure dirty bitmap with correct page size */
                 dirtyEnsureCapacity(p);
+
+                /* R2: Record initial Azure blob size to skip redundant resizes */
+                p->lastSyncedSize = p->nData;
             } else {
                 p->nData = 0;
             }
@@ -1101,33 +1130,46 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
         p->nJrnlAlloc = 0;
         p->aJrnlData = NULL;
 
-        /* Check if journal blob already exists (crash recovery) */
-        if (p->ops && p->ops->blob_exists) {
-            int exists = 0;
+        /* R1: Track journal blob name and seed the cache from blob_exists check */
+        size_t nameLen = strlen(zName);
+        if (nameLen < sizeof(pVfsData->journalBlobName)) {
+            memcpy(pVfsData->journalBlobName, zName, nameLen + 1);
+        }
+
+        /* R1: If cache says journal doesn't exist, skip the HEAD request.
+        ** Only do a real HEAD when cache is unknown (-1) or says it exists (1).
+        ** Since we are the single writer, cache=0 is authoritative. */
+        int exists = 0;
+        if (pVfsData->journalCacheState == 0) {
+            exists = 0;  /* We deleted it — no HEAD needed */
+        } else if (p->ops && p->ops->blob_exists) {
             azure_error_t aerr;
             azure_error_init(&aerr);
             p->ops->blob_exists(p->ops_ctx, zName, &exists, &aerr);
+            pVfsData->journalCacheState = exists ? 1 : 0;
+        }
 
-            if (exists && p->ops->block_blob_download) {
-                azure_buffer_t buf = {0};
-                azure_error_init(&aerr);
-                azure_err_t arc = p->ops->block_blob_download(
-                    p->ops_ctx, zName, &buf, &aerr);
-                if (arc == AZURE_OK && buf.data && buf.size > 0) {
-                    int rc = jrnlBufferEnsure(p, (sqlite3_int64)buf.size);
-                    if (rc == SQLITE_OK) {
-                        memcpy(p->aJrnlData, buf.data, buf.size);
-                        p->nJrnlData = (sqlite3_int64)buf.size;
-                    }
-                    free(buf.data);
-                    if (rc != SQLITE_OK) {
-                        free(p->zBlobName);
-                        p->zBlobName = NULL;
-                        return rc;
-                    }
-                } else {
-                    free(buf.data);
+        /* Check if journal blob already exists (crash recovery) */
+        if (exists && p->ops && p->ops->block_blob_download) {
+            azure_buffer_t buf = {0};
+            azure_error_t aerr;
+            azure_error_init(&aerr);
+            azure_err_t arc = p->ops->block_blob_download(
+                p->ops_ctx, zName, &buf, &aerr);
+            if (arc == AZURE_OK && buf.data && buf.size > 0) {
+                int rc = jrnlBufferEnsure(p, (sqlite3_int64)buf.size);
+                if (rc == SQLITE_OK) {
+                    memcpy(p->aJrnlData, buf.data, buf.size);
+                    p->nJrnlData = (sqlite3_int64)buf.size;
                 }
+                free(buf.data);
+                if (rc != SQLITE_OK) {
+                    free(p->zBlobName);
+                    p->zBlobName = NULL;
+                    return rc;
+                }
+            } else {
+                free(buf.data);
             }
         }
     }
@@ -1154,10 +1196,21 @@ static int azqliteDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
         azure_err_t arc = pVfsData->ops->blob_delete(
             pVfsData->ops_ctx, zName, &aerr);
         if (arc == AZURE_ERR_NOT_FOUND) {
+            /* R1: We know it doesn't exist now */
+            if (pVfsData->journalBlobName[0] &&
+                strcmp(zName, pVfsData->journalBlobName) == 0) {
+                pVfsData->journalCacheState = 0;
+            }
             return SQLITE_OK;  /* Already gone — not an error */
         }
         if (arc != AZURE_OK) {
             return SQLITE_IOERR_DELETE;
+        }
+
+        /* R1: After successful delete, update journal cache */
+        if (pVfsData->journalBlobName[0] &&
+            strcmp(zName, pVfsData->journalBlobName) == 0) {
+            pVfsData->journalCacheState = 0;
         }
         return SQLITE_OK;
     }
@@ -1168,12 +1221,43 @@ static int azqliteDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
 
 /*
 ** xAccess — Check blob existence or readability.
+**
+** R1 optimization: We cache journal blob existence state. Since we are the
+** single writer, we know when the journal exists (we uploaded it in xSync)
+** or doesn't exist (we deleted it in xDelete). This eliminates ~4 HEAD
+** requests per transaction (~110ms saved). WAL is disabled (iVersion=1),
+** so -wal blobs never exist.
 */
 static int azqliteAccess(sqlite3_vfs *pVfs, const char *zName,
                           int flags, int *pResOut) {
     azqliteVfsData *pVfsData = (azqliteVfsData *)pVfs->pAppData;
 
     if (pVfsData->ops && pVfsData->ops->blob_exists) {
+        /* R1: WAL is disabled (iVersion=1) — WAL files never exist */
+        if (zName) {
+            size_t len = strlen(zName);
+            if (len >= 4 && strcmp(zName + len - 4, "-wal") == 0) {
+                *pResOut = 0;
+                return SQLITE_OK;
+            }
+        }
+
+        /* R1: Use cached journal existence when available */
+        if (zName && pVfsData->journalCacheState >= 0 &&
+            pVfsData->journalBlobName[0] &&
+            strcmp(zName, pVfsData->journalBlobName) == 0) {
+            switch (flags) {
+                case SQLITE_ACCESS_EXISTS:
+                case SQLITE_ACCESS_READWRITE:
+                case SQLITE_ACCESS_READ:
+                    *pResOut = pVfsData->journalCacheState;
+                    break;
+                default:
+                    *pResOut = 0;
+            }
+            return SQLITE_OK;
+        }
+
         int exists = 0;
         azure_error_t aerr;
         azure_error_init(&aerr);
@@ -1183,6 +1267,18 @@ static int azqliteAccess(sqlite3_vfs *pVfs, const char *zName,
             *pResOut = 0;
             return SQLITE_OK;  /* Access check should not fail fatally */
         }
+
+        /* R1: Seed journal cache if this is a journal blob we haven't tracked yet.
+        ** Detects journal names by "-journal" suffix (per D7). */
+        if (zName && !pVfsData->journalBlobName[0]) {
+            size_t nlen = strlen(zName);
+            if (nlen >= 8 && strcmp(zName + nlen - 8, "-journal") == 0 &&
+                nlen < sizeof(pVfsData->journalBlobName)) {
+                memcpy(pVfsData->journalBlobName, zName, nlen + 1);
+                pVfsData->journalCacheState = exists ? 1 : 0;
+            }
+        }
+
         switch (flags) {
             case SQLITE_ACCESS_EXISTS:
             case SQLITE_ACCESS_READWRITE:
@@ -1336,6 +1432,7 @@ int azqlite_vfs_register_with_config(const azqlite_config_t *config,
 
     memset(&g_vfsData, 0, sizeof(g_vfsData));
     g_vfsData.pDefaultVfs = pDefault;
+    g_vfsData.journalCacheState = -1;  /* R1: unknown until first journal open */
 
     if (config->ops) {
         /* Use caller-provided ops (test mode) */

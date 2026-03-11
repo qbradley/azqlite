@@ -1646,8 +1646,10 @@ TEST(vfs_lease_expire_during_sync) {
 
     /* VFS inline renewal only triggers after 15s, so in fast tests
     ** lease_renew is never called. Instead, simulate sync failure
-    ** by making page_blob_resize fail (called during xSync). */
-    mock_set_fail_operation(g_ctx, "page_blob_resize", AZURE_ERR_NETWORK);
+    ** by making page_blob_write fail (called during xSync).
+    ** Note: R2 optimization means page_blob_resize may be skipped
+    ** when the blob hasn't grown, so we fail the write instead. */
+    mock_set_fail_operation(g_ctx, "page_blob_write", AZURE_ERR_NETWORK);
 
     int rc = sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
     /* Should fail with IOERR or similar */
@@ -1970,11 +1972,13 @@ TEST(vfs_sync_resize_failure_before_flush) {
     ASSERT_NOT_NULL(db);
     sqlite3_exec(db, "CREATE TABLE t(x);", NULL, NULL, NULL);
 
-    /* page_blob_resize is called during xSync before writing pages.
-    ** If it fails, xSync should return error. */
+    /* R2: page_blob_resize is only called when the blob has grown.
+    ** Insert a large value to force the database to grow beyond its
+    ** current size, ensuring resize IS called and the failure triggers. */
     mock_set_fail_operation(g_ctx, "page_blob_resize", AZURE_ERR_SERVER);
 
-    int rc = sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+    int rc = sqlite3_exec(db,
+        "INSERT INTO t VALUES(zeroblob(65536));", NULL, NULL, NULL);
     ASSERT_NE(rc, SQLITE_OK);
 
     mock_clear_failures(g_ctx);
