@@ -1,3 +1,31 @@
+# Build artifacts
+build/
+*.o
+*.a
+
+# Binaries
+azqlite-shell
+benchmark/speedtest1-azure
+benchmark/tpcc/tpcc-azure
+benchmark/tpcc/tpcc-local
+benchmark/tpcc/build/
+benchmark/results.csv
+
+# Azurite local storage emulator
+__azurite_db_*
+__blobstorage__/
+AzuriteConfig
+
+# Environment / secrets
+.env
+
+# Research build artifacts
+research/azure-poc/*.o
+research/azure-poc/azure_poc
+
+# Database files
+*.db
+
 # Squad: ignore runtime state (logs, inbox, sessions)
 .squad/orchestration-log/
 .squad/log/
