@@ -129,3 +129,20 @@ Completed orchestration summary:
 - **New API proposed:** `page_blob_write_batch(ctx, name, ranges[], nRanges, lease_id, err)` with `azure_page_range_t` struct. Additive to azure_ops_t vtable — backward compatible. Mock can loop over ranges sequentially.
 - **Combined impact:** Clustered 5000 pages: 500s → ~0.2-0.5s. Scattered 5000 pages: 500s → ~5-10s.
 - **Full report:** `.squad/decisions/inbox/frodo-azure-parallel-writes.md`
+
+### Phase 2: curl_multi Batch Write Implementation (2026-03-11)
+
+- **Implemented:** `az_page_blob_write_batch()` in `src/azure_client.c` using libcurl's `curl_multi` interface for parallel PUT Page requests.
+- **Architecture:** For nRanges ≤ 1, delegates to existing sequential `az_page_blob_write()`. For nRanges > 1, creates a `CURLM *multi` handle with one `CURL *easy` handle per range, all configured as PUT Page requests with independent auth headers.
+- **Key design decisions:**
+  - Each easy handle gets its own `struct curl_slist *` headers — cannot share between concurrent handles.
+  - SharedKey auth: each request gets its own `Authorization` header (Content-Length and x-ms-range differ per range).
+  - SAS auth: token appended to shared URL once (all ranges use same URL).
+  - Body data via `CURLOPT_POSTFIELDS` (no copy — aData stable per D17 btree mutex guarantee).
+  - `CURLMOPT_MAX_HOST_CONNECTIONS` and `CURLMOPT_MAXCONNECTS` set to `AZQLITE_MAX_PARALLEL_PUTS` (32).
+- **Retry strategy:** Failed ranges retried up to 3 times with exponential backoff (500ms base). Only retryable errors (transient/throttle) trigger retry. Non-retryable errors (auth, bad request) abort immediately.
+- **Lease renewal:** Checks elapsed time each event loop iteration. If >15 seconds since last renewal, calls `az_lease_renew` using client's own curl handle (NOT from multi pool). Lease loss aborts all in-flight requests.
+- **Event loop:** `curl_multi_perform` + `curl_multi_wait` (1000ms timeout). Results collected via `curl_multi_info_read` with `CURLOPT_PRIVATE` linking each handle back to its `batch_req_t` context.
+- **Wired into vtable:** `.page_blob_write_batch = az_page_blob_write_batch` — VFS now uses parallel path automatically.
+- **Build:** Production compiles clean with zero warnings. All 205 unit tests pass.
+- **Helper types:** `batch_req_t` (per-request context), `batch_init_easy()` (setup one handle), `batch_free_req()` (cleanup).

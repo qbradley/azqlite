@@ -78,3 +78,12 @@ Completed comprehensive design review (D1-D11). Verdict: **APPROVE WITH CONDITIO
 - **4-phase implementation plan:** (1) Coalescing only — 1–2 days, ≥5× for sequential, (2) curl_multi parallel — 3–5 days, ≥50× for bulk, (3) Connection pooling + lease hardening — 1–2 days, (4) Journal chunked upload — 2–3 days. Each phase delivers measurable value.
 - **Projected performance:** 100-page clustered commit drops from 10s → ~200ms. 5,000-page bulk load drops from 500s → ~500ms. VACUUM 100MB drops from 2500s → ~2s.
 - **9-item risk register** covering partial failure, lease expiry, throttling, Azurite compatibility, memory, vtable changes, TLS caching, alignment bugs, and event loop starvation.
+
+### Phase 1+2 Code Review — Reviewer Gate (2026-03-12)
+
+- **Verdict: APPROVED.** Both phases correctly implement the performance design. No blocking issues.
+- **Phase 1 (Aragorn):** `coalesceDirtyRanges()` correctly handles all edge cases — empty, single, contiguous, 4 MiB boundary split, scattered, last-page 512-alignment. The post-loop `i++` for 4 MiB cap boundaries is subtle but correct (page already counted in runPages before break, advance past it for next iteration). Buffer overread from 512-alignment padding is safe because `bufferEnsure` grows geometrically (min 64 KiB doubling), so padding never exceeds nAlloc.
+- **Phase 2 (Frodo):** `az_page_blob_write_batch()` curl_multi event loop is well-structured. Every exit path (success, partial failure, setup failure, lease loss) correctly cleans up all resources. Zero-copy design (CURLOPT_POSTFIELDS pointing into aData) is safe because btree mutex is held during xSync. Lease renewal at 15s intervals on 30s lease gives adequate safety margin. SharedKey signing has correct x-ms header ordering.
+- **Key observation:** The batch retry uses pure exponential backoff without jitter (unlike sequential path). Non-blocking but should be fixed for consistency before Phase 3.
+- **Missing test coverage:** No test for partial batch failure (some ranges succeed, others fail, then retry). Hard to test with current mock (batch=NULL). Tracked as Phase 3 follow-up.
+- **Full review at:** `.squad/decisions/inbox/gandalf-phase12-review.md`
