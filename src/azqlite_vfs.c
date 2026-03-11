@@ -58,8 +58,10 @@ static int azqliteDeviceCharacteristics(sqlite3_file*);
 /* ---------- Constants ---------- */
 
 #define AZQLITE_DEFAULT_PAGE_SIZE  4096
-#define AZQLITE_LEASE_DURATION     30      /* seconds */
-#define AZQLITE_LEASE_RENEW_AFTER  15      /* renew if older than this */
+#define AZQLITE_LEASE_DURATION     30      /* default lease duration (seconds) */
+#define AZQLITE_LEASE_DURATION_LONG 60     /* extended lease for large flushes */
+#define AZQLITE_LEASE_RENEW_AFTER  15      /* default renew threshold (unused — see leaseDuration) */
+#define AZQLITE_DIRTY_PAGE_THRESHOLD 100   /* dirty pages triggering extended lease */
 #define AZQLITE_MAX_PATHNAME       512
 #define AZQLITE_INITIAL_ALLOC      (64*1024)  /* 64 KiB initial buffer */
 
@@ -88,11 +90,16 @@ typedef struct azqliteFile {
     int nDirtyPages;                    /* Count of dirty pages */
     int nDirtyAlloc;                    /* Allocated size of aDirty bitmap */
     int pageSize;                       /* Detected from header or default 4096 */
+    int lastSyncDirtyCount;             /* Dirty pages at last xSync (lease heuristic) */
 
     /* Lock state */
     int eLock;                          /* Current SQLite lock level */
     char leaseId[64];                   /* Azure lease ID (empty = no lease) */
     time_t leaseAcquiredAt;             /* For renewal timing */
+    int leaseDuration;                  /* Actual lease duration acquired (seconds) */
+
+    /* ETag tracking (preparation for MVP 2 cache invalidation) */
+    char etag[128];                     /* Current blob ETag */
 
     /* File type */
     int eFileType;                      /* SQLITE_OPEN_MAIN_DB, etc. */
@@ -245,13 +252,15 @@ static int hasLease(azqliteFile *p) {
 }
 
 /*
-** Attempt to renew the lease if it's older than AZQLITE_LEASE_RENEW_AFTER
-** seconds.  Returns SQLITE_OK or SQLITE_IOERR_LOCK.
+** Attempt to renew the lease if it's older than half the lease duration.
+** Returns SQLITE_OK or SQLITE_IOERR_LOCK.
 */
 static int leaseRenewIfNeeded(azqliteFile *p) {
     if (!hasLease(p)) return SQLITE_OK;
+    int renewAfter = p->leaseDuration > 0 ? p->leaseDuration / 2
+                                          : AZQLITE_LEASE_DURATION / 2;
     time_t now = time(NULL);
-    if (difftime(now, p->leaseAcquiredAt) < AZQLITE_LEASE_RENEW_AFTER) {
+    if (difftime(now, p->leaseAcquiredAt) < renewAfter) {
         return SQLITE_OK;
     }
     azure_error_t aerr;
@@ -552,6 +561,9 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
     if (p->nDirtyPages == 0) return SQLITE_OK;
     if (!p->ops || !p->ops->page_blob_write) return SQLITE_IOERR_FSYNC;
 
+    /* Record dirty page count for lease duration heuristic */
+    int dirtyCountBeforeSync = p->nDirtyPages;
+
     /* Renew lease before flushing */
     int rc = leaseRenewIfNeeded(p);
     if (rc != SQLITE_OK) return SQLITE_IOERR_FSYNC;
@@ -598,6 +610,10 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
             hasLease(p) ? p->leaseId : NULL, &aerr);
         if (ranges != stackRanges) sqlite3_free(ranges);
         if (arc != AZURE_OK) return SQLITE_IOERR_FSYNC;
+        p->lastSyncDirtyCount = dirtyCountBeforeSync;
+        if (aerr.etag[0] != '\0') {
+            memcpy(p->etag, aerr.etag, sizeof(p->etag));
+        }
         dirtyClearAll(p);
         return SQLITE_OK;
     }
@@ -623,6 +639,12 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
             if (ranges != stackRanges) sqlite3_free(ranges);
             return SQLITE_IOERR_FSYNC;
         }
+    }
+
+    /* Capture ETag from last successful write and update dirty count */
+    p->lastSyncDirtyCount = dirtyCountBeforeSync;
+    if (aerr.etag[0] != '\0') {
+        memcpy(p->etag, aerr.etag, sizeof(p->etag));
     }
 
     if (ranges != stackRanges) sqlite3_free(ranges);
@@ -669,11 +691,16 @@ static int azqliteLock(sqlite3_file *pFile, int eLock) {
             return SQLITE_OK;
         }
 
+        /* Choose lease duration based on last sync workload */
+        int duration = (p->lastSyncDirtyCount > AZQLITE_DIRTY_PAGE_THRESHOLD)
+                       ? AZQLITE_LEASE_DURATION_LONG
+                       : AZQLITE_LEASE_DURATION;
+
         azure_error_t aerr;
         azure_error_init(&aerr);
         azure_err_t arc = p->ops->lease_acquire(
             p->ops_ctx, p->zBlobName,
-            AZQLITE_LEASE_DURATION,
+            duration,
             p->leaseId, sizeof(p->leaseId), &aerr);
 
         if (arc == AZURE_ERR_CONFLICT) {
@@ -683,6 +710,7 @@ static int azqliteLock(sqlite3_file *pFile, int eLock) {
             return azureErrToSqlite(arc, SQLITE_IOERR_LOCK);
         }
         p->leaseAcquiredAt = time(NULL);
+        p->leaseDuration = duration;
     }
 
     p->eLock = eLock;
@@ -854,6 +882,9 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     p->eFileType = flags & 0x0000FF00;  /* Extract type flags */
     p->eLock = SQLITE_LOCK_NONE;
     p->leaseId[0] = '\0';
+    p->leaseDuration = AZQLITE_LEASE_DURATION;
+    p->lastSyncDirtyCount = 0;
+    p->etag[0] = '\0';
     p->pageSize = AZQLITE_DEFAULT_PAGE_SIZE;
 
     if (isMainDb) {
@@ -883,6 +914,10 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 free(p->zBlobName);
                 p->zBlobName = NULL;
                 return azureErrToSqlite(arc, SQLITE_CANTOPEN);
+            }
+            /* Capture initial ETag from blob properties */
+            if (aerr.etag[0] != '\0') {
+                memcpy(p->etag, aerr.etag, sizeof(p->etag));
             }
 
             if (blobSize > 0) {

@@ -146,3 +146,18 @@ Completed orchestration summary:
 - **Wired into vtable:** `.page_blob_write_batch = az_page_blob_write_batch` — VFS now uses parallel path automatically.
 - **Build:** Production compiles clean with zero warnings. All 205 unit tests pass.
 - **Helper types:** `batch_req_t` (per-request context), `batch_init_easy()` (setup one handle), `batch_free_req()` (cleanup).
+
+### Phase 3: Persistent CURLM Handle + Connection Pool Tuning (2026-03-11)
+
+- **Problem:** Phase 2 created and destroyed a `CURLM *multi` handle on every `az_page_blob_write_batch()` call (and even per retry attempt). TLS sessions and TCP connections were lost between xSync calls, requiring full TLS handshakes each time.
+- **Solution:** Added persistent `CURLM *multi_handle` field to `azure_client_t` struct. Lazily initialized on first batch write call via `ensure_multi_handle()`. Destroyed in `azure_client_destroy()`. Reused across all batch calls and retry attempts.
+- **Files modified:** `src/azure_client_impl.h` (struct field), `src/azure_client.c` (lazy init, reuse, destroy, tuning, jitter)
+- **Connection pool tuning (set once at CURLM creation):**
+  - `CURLMOPT_MAX_HOST_CONNECTIONS = AZQLITE_MAX_PARALLEL_PUTS` (32)
+  - `CURLMOPT_MAXCONNECTS = AZQLITE_MAX_PARALLEL_PUTS` (32)
+- **TLS session caching:** Explicit `CURLOPT_SSL_SESSIONID_CACHE = 1` on each easy handle. CURLM connection pool manages TLS session reuse automatically across calls.
+- **Keep-alive tuning updated:** `CURLOPT_TCP_KEEPIDLE = 30` (was 60), `CURLOPT_TCP_KEEPINTVL = 15` (was 30). Detects dead connections faster.
+- **Retry jitter added:** Backoff formula now `base_delay * (1 << retry_count) + (rand() % 100)`. PRNG seeded once in `ensure_multi_handle()`. Prevents thundering herd on simultaneous retries.
+- **Easy handle lifecycle unchanged:** Still created per-range, destroyed after each batch call. Only the CURLM multi handle persists — it owns the connection pool.
+- **Thread-safety documented:** Safe because xSync is serialized by SQLite's btree mutex (D17). No concurrent access to the multi handle is possible.
+- **Build:** Production compiles clean with zero warnings. All 205 unit tests pass.

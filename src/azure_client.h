@@ -58,6 +58,7 @@ typedef struct azure_error {
     char error_code[128];           /* Azure error code string, e.g. "BlobNotFound" */
     char error_message[256];        /* Human-readable error */
     char request_id[64];            /* Azure x-ms-request-id for debugging */
+    char etag[128];                 /* ETag from last Azure response (Phase 3) */
 } azure_error_t;
 
 /*
@@ -81,6 +82,7 @@ static inline void azure_error_init(azure_error_t *e) {
         e->error_code[0] = '\0';
         e->error_message[0] = '\0';
         e->request_id[0] = '\0';
+        e->etag[0] = '\0';
     }
 }
 
@@ -94,6 +96,7 @@ static inline void azure_error_clear(azure_error_t *e) {
         e->error_code[0] = '\0';
         e->error_message[0] = '\0';
         e->request_id[0] = '\0';
+        e->etag[0] = '\0';
     }
 }
 

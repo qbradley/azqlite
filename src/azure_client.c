@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <curl/curl.h>
 
 /* ================================================================
@@ -953,6 +954,39 @@ static azure_err_t az_lease_break(void *ctx, const char *name,
 #define BATCH_MAX_RETRIES        3
 #define BATCH_LEASE_RENEWAL_SEC  15
 
+/*
+ * Lazily initialize the persistent CURLM multi handle on the client.
+ * The multi handle is reused across write_batch calls so that libcurl's
+ * internal connection pool and TLS session cache persist between xSync
+ * invocations.  This avoids TCP handshake + TLS negotiation overhead
+ * on subsequent flushes.
+ *
+ * Thread-safety: this is safe because xSync is serialized by SQLite's
+ * btree mutex (D17).  No concurrent calls to write_batch are possible.
+ *
+ * Pool tuning:
+ *   CURLMOPT_MAX_HOST_CONNECTIONS = AZQLITE_MAX_PARALLEL_PUTS (32)
+ *   CURLMOPT_MAXCONNECTS          = AZQLITE_MAX_PARALLEL_PUTS (32)
+ */
+static CURLM *ensure_multi_handle(azure_client_t *c)
+{
+    if (c->multi_handle) return (CURLM *)c->multi_handle;
+
+    CURLM *multi = curl_multi_init();
+    if (!multi) return NULL;
+
+    curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS,
+                      (long)AZQLITE_MAX_PARALLEL_PUTS);
+    curl_multi_setopt(multi, CURLMOPT_MAXCONNECTS,
+                      (long)AZQLITE_MAX_PARALLEL_PUTS);
+
+    /* Seed PRNG once for retry jitter */
+    srand((unsigned)time(NULL));
+
+    c->multi_handle = multi;
+    return multi;
+}
+
 /* Per-request context for one range in a batch */
 typedef struct {
     CURL                     *easy;
@@ -1087,8 +1121,12 @@ static azure_err_t batch_init_easy(
     curl_easy_setopt(req->easy, CURLOPT_TIMEOUT, 60L);
     curl_easy_setopt(req->easy, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPIDLE, 60L);
-    curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPINTVL, 30L);
+    curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(req->easy, CURLOPT_TCP_KEEPINTVL, 15L);
+
+    /* Explicitly enable TLS session ID caching.  The persistent CURLM
+     * handle's connection pool manages TLS session reuse across calls. */
+    curl_easy_setopt(req->easy, CURLOPT_SSL_SESSIONID_CACHE, 1L);
 
     /* Link back to batch context for result collection */
     curl_easy_setopt(req->easy, CURLOPT_PRIVATE, (char *)req);
@@ -1159,6 +1197,16 @@ static azure_err_t az_page_blob_write_batch(
 
     azure_err_t result = AZURE_OK;
 
+    /* ---- Persistent multi handle (lazy init, connection pool reused) ---- */
+    CURLM *multi = ensure_multi_handle(c);
+    if (!multi) {
+        free(done);
+        err->code = AZURE_ERR_NETWORK;
+        snprintf(err->error_message, sizeof(err->error_message),
+                 "curl_multi_init() failed");
+        return AZURE_ERR_NETWORK;
+    }
+
     for (int attempt = 0; attempt <= BATCH_MAX_RETRIES; attempt++) {
         int pending = 0;
         for (int i = 0; i < nRanges; i++) {
@@ -1166,11 +1214,13 @@ static azure_err_t az_page_blob_write_batch(
         }
         if (pending == 0) break;
 
-        /* Exponential backoff before retry (skip first attempt) */
+        /* Exponential backoff + random jitter before retry (skip first attempt).
+         * Jitter prevents thundering herd when multiple clients retry. */
         if (attempt > 0) {
             int delay_ms = AZURE_RETRY_BASE_MS * (1 << (attempt - 1));
             if (delay_ms > AZURE_RETRY_MAX_MS)
                 delay_ms = AZURE_RETRY_MAX_MS;
+            delay_ms += rand() % 100;
             fprintf(stderr,
                     "[azqlite] batch write: %d/%d ranges pending, "
                     "retry %d/%d in %dms\n",
@@ -1178,24 +1228,9 @@ static azure_err_t az_page_blob_write_batch(
             azure_retry_sleep_ms(delay_ms);
         }
 
-        /* ---- Create multi handle ---- */
-        CURLM *multi = curl_multi_init();
-        if (!multi) {
-            free(done);
-            err->code = AZURE_ERR_NETWORK;
-            snprintf(err->error_message, sizeof(err->error_message),
-                     "curl_multi_init() failed");
-            return AZURE_ERR_NETWORK;
-        }
-        curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS,
-                          (long)AZQLITE_MAX_PARALLEL_PUTS);
-        curl_multi_setopt(multi, CURLMOPT_MAXCONNECTS,
-                          (long)AZQLITE_MAX_PARALLEL_PUTS);
-
         /* ---- Set up easy handles for pending ranges ---- */
         batch_req_t *reqs = calloc((size_t)pending, sizeof(batch_req_t));
         if (!reqs) {
-            curl_multi_cleanup(multi);
             free(done);
             err->code = AZURE_ERR_NOMEM;
             return AZURE_ERR_NOMEM;
@@ -1226,7 +1261,6 @@ static azure_err_t az_page_blob_write_batch(
                 batch_free_req(&reqs[j]);
             }
             free(reqs);
-            curl_multi_cleanup(multi);
             free(done);
             return result;
         }
@@ -1310,13 +1344,12 @@ static azure_err_t az_page_blob_write_batch(
             }
         }
 
-        /* ---- Cleanup this attempt ---- */
+        /* ---- Cleanup easy handles (multi handle persists) ---- */
         for (int j = 0; j < req_count; j++) {
             curl_multi_remove_handle(multi, reqs[j].easy);
             batch_free_req(&reqs[j]);
         }
         free(reqs);
-        curl_multi_cleanup(multi);
 
         if (lease_lost) {
             free(done);
@@ -1500,6 +1533,12 @@ azure_err_t azure_client_create(const azure_client_config_t *config,
 void azure_client_destroy(azure_client_t *client)
 {
     if (!client) return;
+
+    /* Destroy persistent multi handle (connection pool + TLS cache) */
+    if (client->multi_handle) {
+        curl_multi_cleanup((CURLM *)client->multi_handle);
+        client->multi_handle = NULL;
+    }
 
     if (client->curl_handle) {
         curl_easy_cleanup((CURL *)client->curl_handle);

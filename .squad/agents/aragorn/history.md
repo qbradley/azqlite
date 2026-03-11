@@ -268,3 +268,17 @@ export AZURE_STORAGE_ACCOUNT=...
 - `vfs_sync_mid_flush_failure` test assumed per-page write count. Coalescing reduces calls — test updated to fail at call 1.
 - `sqlite3_malloc64`/`sqlite3_free` preferred over raw malloc/free inside VFS code for SQLite memory accounting.
 - 4MiB cap = 1024 × 4096-byte pages per range. Most workloads will produce 1-3 ranges per sync.
+
+### Phase 3 Lease Hardening + ETag Tracking (2026-03-11)
+
+**What:** Dynamic lease duration based on workload, ETag plumbing through azure_error_t, proportional lease renewal threshold.
+
+**Files modified:**
+- `src/azure_client.h` — Added `char etag[128]` field to `azure_error_t`; updated `azure_error_init` and `azure_error_clear`.
+- `src/azqlite_vfs.c` — Added `lastSyncDirtyCount`, `leaseDuration`, `etag[128]` fields to `azqliteFile`. Dynamic lease duration in `azqliteLock()` (30s default, 60s if last sync had >100 dirty pages). `leaseRenewIfNeeded()` uses `leaseDuration/2`. `azqliteSync()` records dirty count and captures ETag. `xOpen` captures ETag from `blob_get_properties`.
+
+**Key learnings:**
+- Adding `etag` to `azure_error_t` is cleanest ETag plumbing — it's passed to every op, works with both mock and production code, no vtable changes needed.
+- `lastSyncDirtyCount` starts at 0, so first transaction always gets 30s lease. Only after a heavy sync does the next lock request extend to 60s. This is conservative and correct.
+- `leaseDuration` field tracks what was actually acquired, so renewal threshold adjusts proportionally (30s→renew@15s, 60s→renew@30s).
+- `AZQLITE_LEASE_RENEW_AFTER` kept as fallback constant but no longer primary — `leaseDuration / 2` is the source of truth.
