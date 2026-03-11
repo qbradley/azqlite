@@ -190,7 +190,8 @@ static azure_ops_t g_stubOps = {
     stub_lease_acquire,
     stub_lease_renew,
     stub_lease_release,
-    stub_lease_break
+    stub_lease_break,
+    NULL  /* page_blob_write_batch — not implemented in stub */
 };
 
 /* ---- Public functions ---- */

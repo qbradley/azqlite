@@ -90,8 +90,9 @@ typedef struct {
 /* ── Failure injection ────────────────────────────────────────────── */
 
 typedef struct {
-    int         call_number;  /* 0 = by operation name, >0 = by call # */
-    op_index_t  op;           /* Which operation (for op-name failures) */
+    int         call_number;     /* 0 = by operation name, >0 = by overall call # */
+    int         op_call_number;  /* >0 = by Nth call to specific op, 0 = unused */
+    op_index_t  op;              /* Which operation (for op-name failures) */
     azure_err_t error_code;
     int         active;
 } fail_rule_t;
@@ -112,6 +113,10 @@ struct mock_azure_ctx {
 
     /* Counter for next lease ID */
     int          next_lease_num;
+
+    /* Write recording for coalescing tests */
+    mock_write_record_t write_records[MOCK_MAX_WRITE_RECORDS];
+    int                 write_record_count;
 };
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
@@ -162,20 +167,30 @@ static void set_error(azure_error_t *err, int http_status,
 static azure_err_t check_failures(mock_azure_ctx_t *ctx, op_index_t op,
                                    azure_error_t *err) {
     int call_num = ctx->total_calls; /* Already incremented by caller */
+    int op_call_num = ctx->call_counts[op]; /* Already incremented by caller */
 
     for (int i = 0; i < ctx->fail_rule_count; i++) {
         fail_rule_t *r = &ctx->fail_rules[i];
         if (!r->active) continue;
 
-        /* Fail at specific call number */
+        /* Fail at specific overall call number */
         if (r->call_number > 0 && r->call_number == call_num) {
             r->active = 0; /* One-shot */
             set_error(err, 500, "InjectedFailure", "Mock failure injection");
             return r->error_code;
         }
 
+        /* Fail at Nth call to specific operation */
+        if (r->op_call_number > 0 && r->op == op &&
+            r->op_call_number == op_call_num) {
+            r->active = 0; /* One-shot */
+            set_error(err, 500, "InjectedFailure",
+                      "Mock failure injection (by op call #)");
+            return r->error_code;
+        }
+
         /* Fail specific operation always */
-        if (r->call_number == 0 && r->op == op) {
+        if (r->call_number == 0 && r->op_call_number == 0 && r->op == op) {
             set_error(err, 500, "InjectedFailure", "Mock failure injection (by op)");
             return r->error_code;
         }
@@ -193,10 +208,12 @@ static azure_err_t pre_call(mock_azure_ctx_t *ctx, op_index_t op,
 
 static int ensure_capacity(mock_blob_t *b, int64_t needed) {
     if (needed <= b->capacity) return 0;
+    if (needed < 0) return -1;
     int64_t new_cap = needed;
-    /* Round up to alignment for page blobs */
+    /* Round up to alignment for page blobs — guard against overflow */
     if (b->type == BLOB_TYPE_PAGE) {
-        new_cap = (new_cap + PAGE_BLOB_ALIGNMENT - 1) & ~(PAGE_BLOB_ALIGNMENT - 1);
+        if (new_cap > INT64_MAX - PAGE_BLOB_ALIGNMENT) return -1;
+        new_cap = (new_cap + PAGE_BLOB_ALIGNMENT - 1) & ~(int64_t)(PAGE_BLOB_ALIGNMENT - 1);
     }
     uint8_t *new_data = (uint8_t *)realloc(b->data, (size_t)new_cap);
     if (!new_data) return -1;
@@ -291,6 +308,14 @@ static azure_err_t mock_page_blob_write(void *vctx, const char *name,
     }
 
     memcpy(b->data + offset, data, len);
+
+    /* Record this write for coalescing tests */
+    if (ctx->write_record_count < MOCK_MAX_WRITE_RECORDS) {
+        mock_write_record_t *rec = &ctx->write_records[ctx->write_record_count++];
+        rec->offset = offset;
+        rec->len = len;
+    }
+
     return AZURE_OK;
 }
 
@@ -667,6 +692,8 @@ static azure_ops_t mock_ops = {
     .lease_renew        = mock_lease_renew_impl,
     .lease_release      = mock_lease_release_impl,
     .lease_break        = mock_lease_break_impl,
+    /* Batch write — not implemented in mock (Phase 2) */
+    .page_blob_write_batch = NULL,
 };
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -700,6 +727,7 @@ void mock_reset(mock_azure_ctx_t *ctx) {
     ctx->total_calls = 0;
     ctx->fail_rule_count = 0;
     ctx->next_lease_num = 0;
+    ctx->write_record_count = 0;
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -711,6 +739,7 @@ void mock_set_fail_at(mock_azure_ctx_t *ctx, int call_number,
     if (!ctx || ctx->fail_rule_count >= MAX_FAIL_RULES) return;
     fail_rule_t *r = &ctx->fail_rules[ctx->fail_rule_count++];
     r->call_number = call_number;
+    r->op_call_number = 0;
     r->op = OP_COUNT;
     r->error_code = error_code;
     r->active = 1;
@@ -723,6 +752,20 @@ void mock_set_fail_operation(mock_azure_ctx_t *ctx, const char *op_name,
     if (idx == OP_COUNT) return; /* Unknown operation name */
     fail_rule_t *r = &ctx->fail_rules[ctx->fail_rule_count++];
     r->call_number = 0; /* 0 = by operation name */
+    r->op_call_number = 0;
+    r->op = idx;
+    r->error_code = error_code;
+    r->active = 1;
+}
+
+void mock_set_fail_operation_at(mock_azure_ctx_t *ctx, const char *op_name,
+                                int op_call_number, azure_err_t error_code) {
+    if (!ctx || ctx->fail_rule_count >= MAX_FAIL_RULES) return;
+    op_index_t idx = op_name_to_index(op_name);
+    if (idx == OP_COUNT) return;
+    fail_rule_t *r = &ctx->fail_rules[ctx->fail_rule_count++];
+    r->call_number = 0;
+    r->op_call_number = op_call_number;
     r->op = idx;
     r->error_code = error_code;
     r->active = 1;
@@ -814,4 +857,24 @@ const uint8_t *mock_get_block_blob_data(mock_azure_ctx_t *ctx,
 int mock_blob_exists(mock_azure_ctx_t *ctx, const char *name) {
     if (!ctx) return 0;
     return find_blob(ctx, name) != NULL ? 1 : 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+** Public API — write recording
+** ══════════════════════════════════════════════════════════════════════ */
+
+int mock_get_write_record_count(mock_azure_ctx_t *ctx) {
+    if (!ctx) return 0;
+    return ctx->write_record_count;
+}
+
+mock_write_record_t mock_get_write_record(mock_azure_ctx_t *ctx, int idx) {
+    mock_write_record_t empty = {0, 0};
+    if (!ctx || idx < 0 || idx >= ctx->write_record_count) return empty;
+    return ctx->write_records[idx];
+}
+
+void mock_clear_write_records(mock_azure_ctx_t *ctx) {
+    if (!ctx) return;
+    ctx->write_record_count = 0;
 }

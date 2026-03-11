@@ -458,9 +458,75 @@ static int azqliteTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
     return SQLITE_OK;
 }
 
+/* Maximum bytes per Azure Put Page request (4 MiB) */
+#define AZQLITE_MAX_PUT_PAGE  (4 * 1024 * 1024)
+
+/*
+** coalesceDirtyRanges — Scan the dirty bitmap and merge contiguous dirty
+** pages into azure_page_range_t entries.  Each range is capped at 4 MiB
+** and the final range is 512-byte aligned upward.
+**
+** Returns the number of ranges written to `ranges`, or -1 if maxRanges
+** is too small to hold all the coalesced ranges.
+*/
+static int coalesceDirtyRanges(
+    azqliteFile *p,
+    azure_page_range_t *ranges,
+    int maxRanges
+){
+    if (p->nDirtyPages == 0) return 0;
+    if (!p->aDirty || p->pageSize <= 0 || p->nData <= 0) return 0;
+
+    int nPages = (int)((p->nData + p->pageSize - 1) / p->pageSize);
+    int nRanges = 0;
+    int i = 0;
+
+    while (i < nPages) {
+        /* Skip clean pages */
+        if (!dirtyIsPageDirty(p, i)) { i++; continue; }
+
+        /* Start of a dirty run */
+        int64_t runStart = (int64_t)i * p->pageSize;
+        int runPages = 0;
+
+        while (i < nPages && dirtyIsPageDirty(p, i)) {
+            runPages++;
+            int64_t runBytes = (int64_t)runPages * p->pageSize;
+            if (runBytes >= AZQLITE_MAX_PUT_PAGE) break;
+            i++;
+        }
+
+        /* If we stopped because of the 4 MiB cap, advance past this page */
+        if (i < nPages && dirtyIsPageDirty(p, i)
+            && (int64_t)runPages * p->pageSize >= AZQLITE_MAX_PUT_PAGE) {
+            i++;
+        }
+
+        /* Compute range length.  Last page may be shorter than pageSize. */
+        int64_t runEnd = runStart + (int64_t)runPages * p->pageSize;
+        if (runEnd > p->nData) runEnd = p->nData;
+        size_t len = (size_t)(runEnd - runStart);
+
+        /* 512-byte align up */
+        len = (len + 511) & ~(size_t)511;
+
+        if (nRanges >= maxRanges) return -1;
+
+        ranges[nRanges].offset = runStart;
+        ranges[nRanges].data = p->aData + runStart;
+        ranges[nRanges].len = len;
+        nRanges++;
+    }
+
+    return nRanges;
+}
+
+/* Stack-allocated range threshold (avoid heap for small flushes) */
+#define AZQLITE_STACK_RANGES 64
+
 /*
 ** xSync — Flush dirty pages to Azure.
-** For MAIN_DB: write each dirty page via page_blob_write, renew lease.
+** For MAIN_DB: coalesce dirty pages, then write via batch or sequential fallback.
 ** For MAIN_JOURNAL: upload entire journal via block_blob_upload.
 */
 static int azqliteSync(sqlite3_file *pFile, int flags) {
@@ -503,40 +569,63 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
         }
     }
 
-    int nPages = (int)((p->nData + p->pageSize - 1) / p->pageSize);
-    int flushedCount = 0;
-    for (int i = 0; i < nPages; i++) {
-        if (!dirtyIsPageDirty(p, i)) continue;
+    /* Coalesce dirty pages into contiguous ranges */
+    azure_page_range_t stackRanges[AZQLITE_STACK_RANGES];
+    azure_page_range_t *ranges = stackRanges;
+    int maxRanges = AZQLITE_STACK_RANGES;
 
-        /* Renew lease periodically during large flushes to prevent expiration */
-        if (hasLease(p) && (flushedCount % 50 == 0) && flushedCount > 0) {
+    int nRanges = coalesceDirtyRanges(p, ranges, maxRanges);
+    if (nRanges < 0) {
+        /* Too many ranges for stack — allocate on heap.
+        ** Worst case: one range per dirty page. */
+        maxRanges = p->nDirtyPages;
+        ranges = (azure_page_range_t *)sqlite3_malloc64(
+            (sqlite3_int64)maxRanges * (sqlite3_int64)sizeof(azure_page_range_t));
+        if (!ranges) return SQLITE_NOMEM;
+        nRanges = coalesceDirtyRanges(p, ranges, maxRanges);
+        if (nRanges < 0) {
+            sqlite3_free(ranges);
+            return SQLITE_IOERR_FSYNC;
+        }
+    }
+
+    /* Try batch write if available (Phase 2 — will be non-NULL with curl_multi) */
+    if (p->ops->page_blob_write_batch) {
+        azure_error_init(&aerr);
+        azure_err_t arc = p->ops->page_blob_write_batch(
+            p->ops_ctx, p->zBlobName,
+            ranges, nRanges,
+            hasLease(p) ? p->leaseId : NULL, &aerr);
+        if (ranges != stackRanges) sqlite3_free(ranges);
+        if (arc != AZURE_OK) return SQLITE_IOERR_FSYNC;
+        dirtyClearAll(p);
+        return SQLITE_OK;
+    }
+
+    /* Sequential fallback — write each coalesced range */
+    for (int i = 0; i < nRanges; i++) {
+        /* Renew lease periodically during large flushes */
+        if (hasLease(p) && i > 0 && (i % 50 == 0)) {
             rc = leaseRenewIfNeeded(p);
-            if (rc != SQLITE_OK) return SQLITE_IOERR_FSYNC;
+            if (rc != SQLITE_OK) {
+                if (ranges != stackRanges) sqlite3_free(ranges);
+                return SQLITE_IOERR_FSYNC;
+            }
         }
-
-        sqlite3_int64 offset = (sqlite3_int64)i * p->pageSize;
-        size_t len = p->pageSize;
-
-        /* Last page may be shorter */
-        if (offset + (sqlite3_int64)len > p->nData) {
-            len = (size_t)(p->nData - offset);
-        }
-
-        /* Azure requires 512-byte aligned writes */
-        size_t alignedLen = (len + 511) & ~(size_t)511;
 
         azure_error_init(&aerr);
         azure_err_t arc = p->ops->page_blob_write(
             p->ops_ctx, p->zBlobName,
-            offset, p->aData + offset, alignedLen,
+            ranges[i].offset, ranges[i].data, ranges[i].len,
             hasLease(p) ? p->leaseId : NULL, &aerr);
 
         if (arc != AZURE_OK) {
+            if (ranges != stackRanges) sqlite3_free(ranges);
             return SQLITE_IOERR_FSYNC;
         }
-        flushedCount++;
     }
 
+    if (ranges != stackRanges) sqlite3_free(ranges);
     dirtyClearAll(p);
     return SQLITE_OK;
 }

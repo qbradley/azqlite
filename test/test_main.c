@@ -23,6 +23,7 @@
 */
 #include "test_vfs.c"
 #include "test_azure_client.c"
+#include "test_coalesce.c"
 
 int main(int argc, char **argv) {
     (void)argc;
@@ -38,6 +39,7 @@ int main(int argc, char **argv) {
 
     run_vfs_tests();
     run_azure_client_tests();
+    run_coalesce_tests();
 
     return test_harness_summary();
 }

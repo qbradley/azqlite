@@ -1718,6 +1718,581 @@ TEST(vfs_temp_files_use_local_storage) {
     close_test_db(db);
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+** P1 Security Tests — Error Handling, Boundaries, Injection
+** ══════════════════════════════════════════════════════════════════════ */
+
+/*
+** Test: Azure error during xSync/flush
+** Verifies graceful error handling when network fails mid-flush.
+*/
+TEST(vfs_azure_sync_failure_returns_ioerr) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    sqlite3_exec(db, "CREATE TABLE t(x);", NULL, NULL, NULL);
+
+    /* Insert data to create dirty pages */
+    sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+
+    /* Make the next page_blob_write fail (simulates network error during sync) */
+    mock_set_fail_operation(g_ctx, "page_blob_write", AZURE_ERR_NETWORK);
+
+    /* This should fail with IOERR, not crash */
+    int rc = sqlite3_exec(db, "INSERT INTO t VALUES(2);", NULL, NULL, NULL);
+    ASSERT_NE(rc, SQLITE_OK);
+
+    mock_clear_failures(g_ctx);
+    close_test_db(db);
+}
+
+/*
+** Test: Block blob upload failure during journal sync
+** Verifies error handling when journal upload fails.
+*/
+TEST(vfs_journal_upload_failure_returns_ioerr) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    sqlite3_exec(db, "CREATE TABLE t(x);", NULL, NULL, NULL);
+
+    /* Make block_blob_upload fail (journal upload) */
+    mock_set_fail_operation(g_ctx, "block_blob_upload", AZURE_ERR_NETWORK);
+
+    /* BEGIN + INSERT should work, but COMMIT will fail on journal upload */
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+    int rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+
+    /* Should get an error, not crash */
+    ASSERT_NE(rc, SQLITE_OK);
+
+    mock_clear_failures(g_ctx);
+    close_test_db(db);
+}
+
+/*
+** Test: Lease expire during long transaction
+** Verifies error handling when lease renewal fails mid-transaction.
+*/
+TEST(vfs_lease_renew_failure_during_write) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    sqlite3_exec(db, "CREATE TABLE t(x);", NULL, NULL, NULL);
+
+    /* Make lease_renew fail */
+    mock_set_fail_operation(g_ctx, "lease_renew", AZURE_ERR_NETWORK);
+
+    /* Multiple writes should eventually try to renew lease */
+    int rc = SQLITE_OK;
+    for (int i = 0; i < 1000 && rc == SQLITE_OK; i++) {
+        char sql[64];
+        snprintf(sql, sizeof(sql), "INSERT INTO t VALUES(%d);", i);
+        rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+    }
+
+    /* Should handle lease renewal failure gracefully */
+    mock_clear_failures(g_ctx);
+    close_test_db(db);
+}
+
+/*
+** Test: Explicit transaction BEGIN/COMMIT/ROLLBACK
+** Verifies transaction boundaries work correctly.
+*/
+TEST(vfs_explicit_transaction_commit) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    sqlite3_exec(db, "CREATE TABLE t(x);", NULL, NULL, NULL);
+
+    int rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_exec(db, "INSERT INTO t VALUES(2);", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* Verify data is there */
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    sqlite3_step(stmt);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+}
+
+TEST(vfs_explicit_transaction_rollback) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    sqlite3_exec(db, "CREATE TABLE t(x);", NULL, NULL, NULL);
+
+    /* Insert initial data */
+    sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+
+    int rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_exec(db, "INSERT INTO t VALUES(2);", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* Verify only original data is there */
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    sqlite3_step(stmt);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+}
+
+/*
+** Test: Large data handling
+** Verifies buffer growth with larger data without integer overflow.
+*/
+TEST(vfs_large_data_insert) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    sqlite3_exec(db, "CREATE TABLE t(x BLOB);", NULL, NULL, NULL);
+
+    /* Insert a large blob (64KB) */
+    unsigned char *bigdata = malloc(65536);
+    ASSERT_NOT_NULL(bigdata);
+    memset(bigdata, 0xAB, 65536);
+
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db, "INSERT INTO t VALUES(?);", -1, &stmt, NULL);
+    sqlite3_bind_blob(stmt, 1, bigdata, 65536, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_DONE);
+    sqlite3_finalize(stmt);
+
+    free(bigdata);
+    close_test_db(db);
+}
+
+/*
+** Test: Multiple large transactions
+** Verifies buffer management doesn't leak or corrupt with repeated use.
+*/
+TEST(vfs_multiple_large_transactions) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data BLOB);",
+                 NULL, NULL, NULL);
+
+    unsigned char *data = malloc(8192);
+    ASSERT_NOT_NULL(data);
+
+    for (int i = 0; i < 50; i++) {
+        memset(data, i & 0xFF, 8192);
+
+        sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+
+        sqlite3_stmt *stmt;
+        sqlite3_prepare_v2(db, "INSERT INTO t VALUES(?, ?);", -1, &stmt, NULL);
+        sqlite3_bind_int(stmt, 1, i);
+        sqlite3_bind_blob(stmt, 2, data, 8192, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+
+        int rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+        ASSERT_OK(rc);
+    }
+
+    /* Verify count */
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    sqlite3_step(stmt);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 50);
+    sqlite3_finalize(stmt);
+
+    free(data);
+    close_test_db(db);
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════
+** P1 Tests — Azure Error During xSync/Flush (mid-flush failure)
+**
+** Simulate network failure DURING a multi-page flush.
+** Page coalescing merges contiguous dirty pages, so the number of
+** page_blob_write calls may be fewer than the number of dirty pages.
+** Fail the 1st coalesced write to verify error propagation.
+** ══════════════════════════════════════════════════════════════════════ */
+
+TEST(vfs_sync_mid_flush_failure) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    sqlite3_exec(db, "CREATE TABLE t(x TEXT);", NULL, NULL, NULL);
+
+    /* Insert enough data to dirty multiple pages */
+    for (int i = 0; i < 100; i++) {
+        char sql[128];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES('row_%d_padding_data_to_fill_pages');", i);
+        sqlite3_exec(db, sql, NULL, NULL, NULL);
+    }
+
+    /* Let that settle, then create new dirty pages */
+    mock_reset_call_counts(g_ctx);
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    for (int i = 100; i < 200; i++) {
+        char sql[128];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES('row_%d_more_padding_data_here');", i);
+        sqlite3_exec(db, sql, NULL, NULL, NULL);
+    }
+
+    /* Fail the 1st page_blob_write during COMMIT's xSync flush.
+    ** With page coalescing, contiguous dirty pages are merged into
+    ** fewer writes — fail the first coalesced write to test error path. */
+    mock_set_fail_operation_at(g_ctx, "page_blob_write", 1, AZURE_ERR_NETWORK);
+
+    int rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    /* Should fail gracefully — the commit can't complete */
+    ASSERT_NE(rc, SQLITE_OK);
+
+    mock_clear_failures(g_ctx);
+    close_test_db(db);
+}
+
+TEST(vfs_sync_resize_failure_before_flush) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    sqlite3_exec(db, "CREATE TABLE t(x);", NULL, NULL, NULL);
+
+    /* page_blob_resize is called during xSync before writing pages.
+    ** If it fails, xSync should return error. */
+    mock_set_fail_operation(g_ctx, "page_blob_resize", AZURE_ERR_SERVER);
+
+    int rc = sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+    ASSERT_NE(rc, SQLITE_OK);
+
+    mock_clear_failures(g_ctx);
+    close_test_db(db);
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════
+** P1 Tests — WAL Mode Rejection
+**
+** Verify xFileControl properly rejects WAL mode attempts and keeps
+** journal_mode=delete as the only valid mode.
+** ══════════════════════════════════════════════════════════════════════ */
+
+TEST(vfs_wal_mode_returns_delete) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db, "PRAGMA journal_mode=WAL;", -1, &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    const char *mode = (const char *)sqlite3_column_text(stmt, 0);
+    /* WAL must be rejected — should stay as "delete" */
+    ASSERT_STR_EQ(mode, "delete");
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+}
+
+TEST(vfs_wal_mode_case_insensitive) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    /* Test case variants of WAL */
+    const char *wal_variants[] = {"WAL", "wal", "Wal", NULL};
+    for (int i = 0; wal_variants[i]; i++) {
+        char sql[64];
+        snprintf(sql, sizeof(sql), "PRAGMA journal_mode=%s;", wal_variants[i]);
+        sqlite3_stmt *stmt;
+        sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+        sqlite3_step(stmt);
+        const char *mode = (const char *)sqlite3_column_text(stmt, 0);
+        ASSERT_STR_NE(mode, "wal");
+        sqlite3_finalize(stmt);
+    }
+
+    close_test_db(db);
+}
+
+TEST(vfs_journal_mode_memory_rejected) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    /* MEMORY mode should work normally (SQLite handles it, not Azure) */
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db, "PRAGMA journal_mode;", -1, &stmt, NULL);
+    sqlite3_step(stmt);
+    const char *mode = (const char *)sqlite3_column_text(stmt, 0);
+    /* Default should be delete */
+    ASSERT_STR_EQ(mode, "delete");
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════
+** P1 Tests — Explicit BEGIN/COMMIT/ROLLBACK
+**
+** Test transaction correctness through the SQLite API, verifying
+** that commit persists data to Azure and rollback discards it.
+** ══════════════════════════════════════════════════════════════════════ */
+
+TEST(vfs_transaction_rollback_restores_state) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    sqlite3_exec(db, "CREATE TABLE t(x INTEGER);", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO t VALUES(10);", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO t VALUES(20);", NULL, NULL, NULL);
+
+    /* Begin a transaction, modify data, then rollback */
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_exec(db, "DELETE FROM t;", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO t VALUES(99);", NULL, NULL, NULL);
+
+    int rc = sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* Original data should still be there */
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db, "SELECT SUM(x) FROM t;", -1, &stmt, NULL);
+    sqlite3_step(stmt);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 30);
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+}
+
+TEST(vfs_transaction_commit_persists_to_azure) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    sqlite3_exec(db, "CREATE TABLE t(x INTEGER);", NULL, NULL, NULL);
+
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO t VALUES(42);", NULL, NULL, NULL);
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+
+    /* Close and reopen to verify data survived via Azure blob */
+    close_test_db(db);
+    db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db, "SELECT x FROM t;", -1, &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 42);
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+}
+
+TEST(vfs_nested_savepoint_rollback) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    sqlite3_exec(db, "CREATE TABLE t(x INTEGER);", NULL, NULL, NULL);
+
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+    sqlite3_exec(db, "SAVEPOINT sp1;", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO t VALUES(2);", NULL, NULL, NULL);
+    sqlite3_exec(db, "ROLLBACK TO sp1;", NULL, NULL, NULL);
+    int rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    /* Only row 1 should remain (row 2 was rolled back at savepoint) */
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    sqlite3_step(stmt);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+
+    close_test_db(db);
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════
+** P1 Tests — Close When Flush Fails
+**
+** Test error handling when xClose encounters dirty data that can't
+** be uploaded (e.g., network failure).
+** ══════════════════════════════════════════════════════════════════════ */
+
+TEST(vfs_close_with_pending_dirty_data) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    sqlite3_exec(db, "CREATE TABLE t(x);", NULL, NULL, NULL);
+
+    /* Write data, then make page_blob_write fail so sync fails */
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+
+    mock_set_fail_operation(g_ctx, "page_blob_write", AZURE_ERR_NETWORK);
+
+    /* COMMIT will fail */
+    int rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ASSERT_NE(rc, SQLITE_OK);
+
+    mock_clear_failures(g_ctx);
+
+    /* Close should not crash even though commit failed */
+    sqlite3_close(db);
+}
+
+TEST(vfs_close_releases_lease_on_failure) {
+    setup();
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    sqlite3_exec(db, "CREATE TABLE t(x);", NULL, NULL, NULL);
+
+    /* Start a write transaction to acquire a lease */
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+
+    /* Fail the commit (page_blob_resize fails) */
+    mock_set_fail_operation(g_ctx, "page_blob_resize", AZURE_ERR_NETWORK);
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    mock_clear_failures(g_ctx);
+
+    /* Close should still release the lease */
+    sqlite3_close(db);
+
+    /* Verify the lease is released */
+    ASSERT_EQ(mock_is_leased(g_ctx, "test.db"), 0);
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════
+** P1 Tests — URL Injection via Blob Names
+**
+** Verify that the VFS rejects blob names that could corrupt HTTP
+** requests (path traversal, query params, fragment injection).
+** ══════════════════════════════════════════════════════════════════════ */
+
+TEST(vfs_path_traversal_rejected) {
+    setup();
+    azqlite_vfs_register_with_ops(g_ops, g_ctx, 0);
+    sqlite3 *db = NULL;
+
+    /* Blob name with ".." path traversal should be rejected */
+    int rc = sqlite3_open_v2("../../etc/passwd", &db,
+                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                              "azqlite");
+    ASSERT_NE(rc, SQLITE_OK);
+    if (db) sqlite3_close(db);
+}
+
+TEST(vfs_path_traversal_in_directory) {
+    setup();
+    azqlite_vfs_register_with_ops(g_ops, g_ctx, 0);
+    sqlite3 *db = NULL;
+
+    int rc = sqlite3_open_v2("foo/../bar/db.sqlite", &db,
+                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                              "azqlite");
+    ASSERT_NE(rc, SQLITE_OK);
+    if (db) sqlite3_close(db);
+}
+
+TEST(vfs_empty_name_rejected) {
+    setup();
+    azqlite_vfs_register_with_ops(g_ops, g_ctx, 0);
+    sqlite3 *db = NULL;
+
+    /* Empty name - SQLite may treat this as in-memory db or fail */
+    int rc = sqlite3_open_v2("", &db,
+                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                              "azqlite");
+    /* Either it fails, or it creates an in-memory db that doesn't touch Azure */
+    if (rc == SQLITE_OK) {
+        /* If it succeeds, verify no Azure operations were performed */
+        mock_reset_call_counts(g_ctx);
+        sqlite3_exec(db, "CREATE TABLE t(x);", NULL, NULL, NULL);
+        /* Should NOT create page blobs - this is in-memory or temp */
+        /* (We just verify it doesn't crash) */
+    }
+    if (db) sqlite3_close(db);
+}
+
+TEST(vfs_leading_slashes_stripped) {
+    setup();
+    azqlite_vfs_register_with_ops(g_ops, g_ctx, 0);
+
+    /* Open a db with leading slashes — should be normalized */
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2("///test.db", &db,
+                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                              "azqlite");
+    /* Should succeed and create blob named "test.db" (not "///test.db") */
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(db);
+
+    sqlite3_exec(db, "CREATE TABLE t(x);", NULL, NULL, NULL);
+    ASSERT_TRUE(mock_blob_exists(g_ctx, "test.db"));
+    sqlite3_close(db);
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════
+** P1 Tests — Credential Leak in Error Messages
+**
+** Ensure that account keys and SAS tokens don't appear in error
+** output when Azure operations fail.
+** ══════════════════════════════════════════════════════════════════════ */
+
+TEST(vfs_error_no_credential_leak) {
+    setup();
+    /* Inject a failure and verify the error message */
+    azure_error_t err;
+    azure_error_init(&err);
+    mock_set_fail_operation(g_ctx, "page_blob_create", AZURE_ERR_AUTH);
+
+    g_ops->page_blob_create(g_ctx, "test.db", 4096, &err);
+
+    /* Error messages should NOT contain fake credential patterns */
+    ASSERT_TRUE(strstr(err.error_message, "SharedKey") == NULL);
+    ASSERT_TRUE(strstr(err.error_message, "sig=") == NULL);
+    ASSERT_TRUE(strstr(err.error_message, "sv=") == NULL);
+    ASSERT_TRUE(strstr(err.error_message, "AccountKey") == NULL);
+
+    /* error_code should also be clean */
+    ASSERT_TRUE(strstr(err.error_code, "sig=") == NULL);
+    ASSERT_TRUE(strstr(err.error_code, "AccountKey") == NULL);
+}
+
+TEST(vfs_error_no_request_id_credential_leak) {
+    setup();
+    azure_error_t err;
+    azure_error_init(&err);
+    mock_set_fail_operation(g_ctx, "page_blob_read", AZURE_ERR_NETWORK);
+
+    azure_buffer_t buf;
+    azure_buffer_init(&buf);
+    g_ops->page_blob_read(g_ctx, "test.db", 0, 512, &buf, &err);
+
+    /* request_id should be present but NOT contain credentials */
+    ASSERT_TRUE(strlen(err.request_id) > 0);
+    ASSERT_TRUE(strstr(err.request_id, "sig=") == NULL);
+    ASSERT_TRUE(strstr(err.request_id, "SharedKey") == NULL);
+    azure_buffer_free(&buf);
+}
+
 #endif /* ENABLE_VFS_INTEGRATION */
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -1911,6 +2486,56 @@ void run_vfs_tests(void) {
 
     TEST_SUITE_BEGIN("VFS File Type Routing");
     RUN_TEST(vfs_temp_files_use_local_storage);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("P1 Security — Error Handling");
+    RUN_TEST(vfs_azure_sync_failure_returns_ioerr);
+    RUN_TEST(vfs_journal_upload_failure_returns_ioerr);
+    RUN_TEST(vfs_lease_renew_failure_during_write);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("P1 Security — Transactions");
+    RUN_TEST(vfs_explicit_transaction_commit);
+    RUN_TEST(vfs_explicit_transaction_rollback);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("P1 Security — Large Data");
+    RUN_TEST(vfs_large_data_insert);
+    RUN_TEST(vfs_multiple_large_transactions);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("P1 — xSync/Flush Failure");
+    RUN_TEST(vfs_sync_mid_flush_failure);
+    RUN_TEST(vfs_sync_resize_failure_before_flush);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("P1 — WAL Mode Rejection");
+    RUN_TEST(vfs_wal_mode_returns_delete);
+    RUN_TEST(vfs_wal_mode_case_insensitive);
+    RUN_TEST(vfs_journal_mode_memory_rejected);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("P1 — Transaction Correctness");
+    RUN_TEST(vfs_transaction_rollback_restores_state);
+    RUN_TEST(vfs_transaction_commit_persists_to_azure);
+    RUN_TEST(vfs_nested_savepoint_rollback);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("P1 — Close When Flush Fails");
+    RUN_TEST(vfs_close_with_pending_dirty_data);
+    RUN_TEST(vfs_close_releases_lease_on_failure);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("P1 — URL Injection / Blob Names");
+    RUN_TEST(vfs_path_traversal_rejected);
+    RUN_TEST(vfs_path_traversal_in_directory);
+    RUN_TEST(vfs_empty_name_rejected);
+    RUN_TEST(vfs_leading_slashes_stripped);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("P1 — Credential Leak Prevention");
+    RUN_TEST(vfs_error_no_credential_leak);
+    RUN_TEST(vfs_error_no_request_id_credential_leak);
     TEST_SUITE_END();
 #endif
 

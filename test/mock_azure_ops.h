@@ -78,6 +78,14 @@ void mock_set_fail_at(mock_azure_ctx_t *ctx, int call_number,
 void mock_set_fail_operation(mock_azure_ctx_t *ctx, const char *op_name,
                              azure_err_t error_code);
 
+/*
+** Make the Nth call (1-based) to a specific operation fail.
+** Example: mock_set_fail_operation_at(ctx, "page_blob_write", 2, AZURE_ERR_NETWORK)
+**   → first page_blob_write succeeds, second page_blob_write fails.
+*/
+void mock_set_fail_operation_at(mock_azure_ctx_t *ctx, const char *op_name,
+                                int op_call_number, azure_err_t error_code);
+
 /* Clear all failure injection rules. */
 void mock_clear_failures(mock_azure_ctx_t *ctx);
 
@@ -130,6 +138,26 @@ const uint8_t *mock_get_block_blob_data(mock_azure_ctx_t *ctx,
 
 /* Check if any blob (page or block) exists by name. */
 int mock_blob_exists(mock_azure_ctx_t *ctx, const char *name);
+
+/* ══════════════════════════════════════════════════════════════════════
+** Write recording — tracks page_blob_write calls for coalescing tests
+** ══════════════════════════════════════════════════════════════════════ */
+
+#define MOCK_MAX_WRITE_RECORDS 1024
+
+typedef struct {
+    int64_t offset;
+    size_t  len;
+} mock_write_record_t;
+
+/* Get the number of recorded page_blob_write calls since last clear. */
+int mock_get_write_record_count(mock_azure_ctx_t *ctx);
+
+/* Get a specific write record (0-based). Returns zeroed record if out of range. */
+mock_write_record_t mock_get_write_record(mock_azure_ctx_t *ctx, int idx);
+
+/* Clear all write records. Also called by mock_reset(). */
+void mock_clear_write_records(mock_azure_ctx_t *ctx);
 
 #ifdef __cplusplus
 }

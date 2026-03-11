@@ -112,6 +112,17 @@ static inline void azure_buffer_free(azure_buffer_t *buf) {
     buf->capacity = 0;
 }
 
+/* A contiguous page range for batch writes */
+typedef struct azure_page_range {
+    int64_t offset;          /* Must be 512-byte aligned */
+    const uint8_t *data;     /* Pointer into cache buffer */
+    size_t len;              /* Must be 512-byte aligned, max 4 MiB */
+} azure_page_range_t;
+
+#ifndef AZQLITE_MAX_PARALLEL_PUTS
+#define AZQLITE_MAX_PARALLEL_PUTS 32
+#endif
+
 /* -----------------------------------------------------------------------
 ** azure_ops_t — The swappable Azure operations vtable
 **
@@ -206,6 +217,16 @@ struct azure_ops {
     azure_err_t (*lease_break)(void *ctx, const char *name,
                                 int break_period_secs, int *remaining_secs,
                                 azure_error_t *err);
+
+    /* ---- Batch Write (Phase 2 — NULL until curl_multi implemented) ---- */
+
+    /* Write multiple page ranges in parallel.
+    ** NULL = VFS falls back to sequential page_blob_write().
+    ** Returns AZURE_OK only if ALL writes succeed. */
+    azure_err_t (*page_blob_write_batch)(
+        void *ctx, const char *name,
+        const azure_page_range_t *ranges, int nRanges,
+        const char *lease_id, azure_error_t *err);
 };
 
 

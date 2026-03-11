@@ -958,6 +958,8 @@ static const azure_ops_t azure_production_ops = {
     .lease_renew   = az_lease_renew,
     .lease_release = az_lease_release,
     .lease_break   = az_lease_break,
+    /* Batch write — not yet implemented (Phase 2, curl_multi) */
+    .page_blob_write_batch = NULL,
 };
 
 /* ================================================================

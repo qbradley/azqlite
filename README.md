@@ -73,6 +73,31 @@ make test-integration
 
 Runs 10 tests against a local Azurite instance.
 
+### Benchmarks
+
+Compare local SQLite vs azqlite performance using SQLite's official speedtest1 benchmark:
+
+```bash
+cd benchmark
+
+# Local-only benchmark (no Azure required)
+make && ./benchmark --local-only --size 25
+
+# Full comparison (requires Azure credentials)
+make all-production
+export AZURE_STORAGE_ACCOUNT=myaccount
+export AZURE_STORAGE_KEY=mykey
+export AZURE_STORAGE_CONTAINER=benchmarks
+./benchmark --size 50
+
+# CSV output for automation
+./benchmark --output csv > results.csv
+```
+
+See [`benchmark/README.md`](benchmark/README.md) for detailed usage.
+
+**Expected performance:** Azure is 2-50x slower than local SQLite depending on workload characteristics. The in-memory cache significantly reduces the gap for read-heavy workloads.
+
 ## Usage
 
 ### Environment Variables
