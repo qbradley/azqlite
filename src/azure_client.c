@@ -18,7 +18,33 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/time.h>
 #include <curl/curl.h>
+
+/* ================================================================
+ * Debug timing — opt-in via AZQLITE_DEBUG_TIMING=1 env var
+ * ================================================================ */
+
+static int g_az_debug_timing = -1;
+
+static int az_debug_timing(void) {
+    if (g_az_debug_timing < 0) {
+        const char *val = getenv("AZQLITE_DEBUG_TIMING");
+        g_az_debug_timing = (val && val[0] == '1') ? 1 : 0;
+    }
+    return g_az_debug_timing;
+}
+
+static double az_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+/* Per-request stats for debug timing */
+static int g_http_request_count = 0;
+static int g_tls_reuse_count = 0;
+static int g_tls_new_count = 0;
 
 /* ================================================================
  * Buffer management (init/free are inline in azure_client.h)
@@ -368,8 +394,35 @@ static azure_err_t execute_single(
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
 
     /* Execute */
+    double req_t0 = 0;
+    if (az_debug_timing()) req_t0 = az_time_ms();
+
     res = curl_easy_perform(curl);
     curl_slist_free_all(headers);
+
+    if (az_debug_timing()) {
+        double req_elapsed = az_time_ms() - req_t0;
+        g_http_request_count++;
+
+        /* Check connection reuse: connect_time==0 means reused */
+        double connect_time = 0, appconnect_time = 0, namelookup_time = 0;
+        curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME, &connect_time);
+        curl_easy_getinfo(curl, CURLINFO_APPCONNECT_TIME, &appconnect_time);
+        curl_easy_getinfo(curl, CURLINFO_NAMELOOKUP_TIME, &namelookup_time);
+
+        int reused = (connect_time == 0.0) ? 1 : 0;
+        if (reused) g_tls_reuse_count++;
+        else g_tls_new_count++;
+
+        fprintf(stderr, "[TIMING] HTTP %s %s: %.1fms (dns=%.1fms tcp=%.1fms tls=%.1fms %s) "
+                "body=%zu req#%d\n",
+                method, blob_name, req_elapsed,
+                namelookup_time * 1000.0,
+                connect_time * 1000.0,
+                appconnect_time * 1000.0,
+                reused ? "REUSED" : "NEW",
+                body_len, g_http_request_count);
+    }
 
     if (res != CURLE_OK) {
         err->code = AZURE_ERR_CURL;
@@ -1270,6 +1323,9 @@ static azure_err_t az_page_blob_write_batch(
         time_t last_renewal = time(NULL);
         int lease_lost = 0;
 
+        double batch_t0 = 0;
+        if (az_debug_timing()) batch_t0 = az_time_ms();
+
         curl_multi_perform(multi, &still_running);
 
         while (still_running > 0) {
@@ -1345,6 +1401,18 @@ static azure_err_t az_page_blob_write_batch(
         }
 
         /* ---- Cleanup easy handles (multi handle persists) ---- */
+        if (az_debug_timing()) {
+            double batch_elapsed = az_time_ms() - batch_t0;
+            int completed = 0;
+            for (int i = 0; i < nRanges; i++) {
+                if (done[i]) completed++;
+            }
+            fprintf(stderr, "[TIMING] batch_multi: %.1fms attempt=%d handles=%d "
+                    "completed=%d/%d (reuse=%d new=%d)\n",
+                    batch_elapsed, attempt, req_count,
+                    completed, nRanges, g_tls_reuse_count, g_tls_new_count);
+        }
+
         for (int j = 0; j < req_count; j++) {
             curl_multi_remove_handle(multi, reqs[j].easy);
             batch_free_req(&reqs[j]);

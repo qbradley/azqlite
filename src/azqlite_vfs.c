@@ -23,7 +23,32 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <sys/time.h>
 #include <assert.h>
+
+/* ===================================================================
+** Debug timing — opt-in via AZQLITE_DEBUG_TIMING=1 environment variable
+** =================================================================== */
+
+static int g_debug_timing = -1; /* -1 = unchecked, 0 = off, 1 = on */
+
+static int azqlite_debug_timing(void) {
+    if (g_debug_timing < 0) {
+        const char *val = getenv("AZQLITE_DEBUG_TIMING");
+        g_debug_timing = (val && val[0] == '1') ? 1 : 0;
+    }
+    return g_debug_timing;
+}
+
+static double azqlite_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+/* Cumulative stats reset each xSync */
+static int g_xread_count = 0;
+static int g_xread_journal_count = 0;
 
 /* ---------- Forward declarations ---------- */
 
@@ -360,9 +385,11 @@ static int azqliteRead(sqlite3_file *pFile, void *pBuf, int iAmt,
     if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
         src = p->aJrnlData;
         srcLen = p->nJrnlData;
+        g_xread_journal_count++;
     } else {
         src = p->aData;
         srcLen = p->nData;
+        g_xread_count++;
     }
 
     if (iOfst >= srcLen) {
@@ -546,10 +573,20 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
     if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
         /* Upload journal as block blob */
         if (p->nJrnlData > 0 && p->ops && p->ops->block_blob_upload) {
+            double t0 = 0;
+            if (azqlite_debug_timing()) t0 = azqlite_time_ms();
+
             azure_error_init(&aerr);
             azure_err_t arc = p->ops->block_blob_upload(
                 p->ops_ctx, p->zBlobName,
                 p->aJrnlData, (size_t)p->nJrnlData, &aerr);
+
+            if (azqlite_debug_timing()) {
+                double elapsed = azqlite_time_ms() - t0;
+                fprintf(stderr, "[TIMING] xSync(journal): %.1fms (%lld bytes, blob=%s)\n",
+                        elapsed, (long long)p->nJrnlData, p->zBlobName);
+            }
+
             if (arc != AZURE_OK) {
                 return SQLITE_IOERR_FSYNC;
             }
@@ -561,6 +598,9 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
     if (p->nDirtyPages == 0) return SQLITE_OK;
     if (!p->ops || !p->ops->page_blob_write) return SQLITE_IOERR_FSYNC;
 
+    double sync_t0 = 0;
+    if (azqlite_debug_timing()) sync_t0 = azqlite_time_ms();
+
     /* Record dirty page count for lease duration heuristic */
     int dirtyCountBeforeSync = p->nDirtyPages;
 
@@ -569,27 +609,34 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
     if (rc != SQLITE_OK) return SQLITE_IOERR_FSYNC;
 
     /* If the blob needs to grow, resize first */
+    double resize_ms = 0;
     if (p->nData > 0 && p->ops->page_blob_resize) {
         sqlite3_int64 alignedSize = (p->nData + 511) & ~(sqlite3_int64)511;
+        double rt0 = 0;
+        if (azqlite_debug_timing()) rt0 = azqlite_time_ms();
+
         azure_error_init(&aerr);
         azure_err_t arc = p->ops->page_blob_resize(p->ops_ctx, p->zBlobName,
                                                      alignedSize,
                                                      hasLease(p) ? p->leaseId : NULL,
                                                      &aerr);
+        if (azqlite_debug_timing()) resize_ms = azqlite_time_ms() - rt0;
+
         if (arc != AZURE_OK) {
             return SQLITE_IOERR_FSYNC;
         }
     }
 
     /* Coalesce dirty pages into contiguous ranges */
+    double coalesce_t0 = 0;
+    if (azqlite_debug_timing()) coalesce_t0 = azqlite_time_ms();
+
     azure_page_range_t stackRanges[AZQLITE_STACK_RANGES];
     azure_page_range_t *ranges = stackRanges;
     int maxRanges = AZQLITE_STACK_RANGES;
 
     int nRanges = coalesceDirtyRanges(p, ranges, maxRanges);
     if (nRanges < 0) {
-        /* Too many ranges for stack — allocate on heap.
-        ** Worst case: one range per dirty page. */
         maxRanges = p->nDirtyPages;
         ranges = (azure_page_range_t *)sqlite3_malloc64(
             (sqlite3_int64)maxRanges * (sqlite3_int64)sizeof(azure_page_range_t));
@@ -601,13 +648,35 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
         }
     }
 
+    double coalesce_ms = 0;
+    if (azqlite_debug_timing()) coalesce_ms = azqlite_time_ms() - coalesce_t0;
+
     /* Try batch write if available (Phase 2 — will be non-NULL with curl_multi) */
     if (p->ops->page_blob_write_batch) {
+        double wt0 = 0;
+        if (azqlite_debug_timing()) wt0 = azqlite_time_ms();
+
         azure_error_init(&aerr);
         azure_err_t arc = p->ops->page_blob_write_batch(
             p->ops_ctx, p->zBlobName,
             ranges, nRanges,
             hasLease(p) ? p->leaseId : NULL, &aerr);
+
+        if (azqlite_debug_timing()) {
+            double write_ms = azqlite_time_ms() - wt0;
+            double total_ms = azqlite_time_ms() - sync_t0;
+            size_t total_bytes = 0;
+            for (int i = 0; i < nRanges; i++) total_bytes += ranges[i].len;
+            fprintf(stderr, "[TIMING] xSync(db): total=%.1fms | resize=%.1fms coalesce=%.1fms "
+                    "write_batch=%.1fms | dirty_pages=%d ranges=%d bytes=%zu "
+                    "reads_since_sync=%d jrnl_reads=%d\n",
+                    total_ms, resize_ms, coalesce_ms, write_ms,
+                    dirtyCountBeforeSync, nRanges, total_bytes,
+                    g_xread_count, g_xread_journal_count);
+            g_xread_count = 0;
+            g_xread_journal_count = 0;
+        }
+
         if (ranges != stackRanges) sqlite3_free(ranges);
         if (arc != AZURE_OK) return SQLITE_IOERR_FSYNC;
         p->lastSyncDirtyCount = dirtyCountBeforeSync;
@@ -619,6 +688,9 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
     }
 
     /* Sequential fallback — write each coalesced range */
+    double write_t0 = 0;
+    if (azqlite_debug_timing()) write_t0 = azqlite_time_ms();
+
     for (int i = 0; i < nRanges; i++) {
         /* Renew lease periodically during large flushes */
         if (hasLease(p) && i > 0 && (i % 50 == 0)) {
@@ -639,6 +711,21 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
             if (ranges != stackRanges) sqlite3_free(ranges);
             return SQLITE_IOERR_FSYNC;
         }
+    }
+
+    if (azqlite_debug_timing()) {
+        double write_ms = azqlite_time_ms() - write_t0;
+        double total_ms = azqlite_time_ms() - sync_t0;
+        size_t total_bytes = 0;
+        for (int i = 0; i < nRanges; i++) total_bytes += ranges[i].len;
+        fprintf(stderr, "[TIMING] xSync(db): total=%.1fms | resize=%.1fms coalesce=%.1fms "
+                "write_seq=%.1fms | dirty_pages=%d ranges=%d bytes=%zu "
+                "reads_since_sync=%d jrnl_reads=%d\n",
+                total_ms, resize_ms, coalesce_ms, write_ms,
+                dirtyCountBeforeSync, nRanges, total_bytes,
+                g_xread_count, g_xread_journal_count);
+        g_xread_count = 0;
+        g_xread_journal_count = 0;
     }
 
     /* Capture ETag from last successful write and update dirty count */
@@ -696,12 +783,21 @@ static int azqliteLock(sqlite3_file *pFile, int eLock) {
                        ? AZQLITE_LEASE_DURATION_LONG
                        : AZQLITE_LEASE_DURATION;
 
+        double t0 = 0;
+        if (azqlite_debug_timing()) t0 = azqlite_time_ms();
+
         azure_error_t aerr;
         azure_error_init(&aerr);
         azure_err_t arc = p->ops->lease_acquire(
             p->ops_ctx, p->zBlobName,
             duration,
             p->leaseId, sizeof(p->leaseId), &aerr);
+
+        if (azqlite_debug_timing()) {
+            double elapsed = azqlite_time_ms() - t0;
+            fprintf(stderr, "[TIMING] lease_acquire: %.1fms (lock=%d, blob=%s)\n",
+                    elapsed, eLock, p->zBlobName);
+        }
 
         if (arc == AZURE_ERR_CONFLICT) {
             return SQLITE_BUSY;
@@ -729,10 +825,19 @@ static int azqliteUnlock(sqlite3_file *pFile, int eLock) {
     /* Release the lease when dropping below RESERVED */
     if (eLock <= SQLITE_LOCK_SHARED && hasLease(p)) {
         if (p->ops && p->ops->lease_release) {
+            double t0 = 0;
+            if (azqlite_debug_timing()) t0 = azqlite_time_ms();
+
             azure_error_t aerr;
             azure_error_init(&aerr);
             p->ops->lease_release(p->ops_ctx, p->zBlobName,
                                    p->leaseId, &aerr);
+
+            if (azqlite_debug_timing()) {
+                double elapsed = azqlite_time_ms() - t0;
+                fprintf(stderr, "[TIMING] lease_release: %.1fms (blob=%s)\n",
+                        elapsed, p->zBlobName);
+            }
             /* Ignore errors on release — best effort */
         }
         p->leaseId[0] = '\0';
