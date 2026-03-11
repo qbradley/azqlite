@@ -134,8 +134,8 @@ run-azure: $(TPCC_AZURE_BIN)
 clean:
 	rm -rf $(TPCC_BUILD)
 	rm -f $(TPCC_LOCAL_BIN) $(TPCC_AZURE_BIN)
-	rm -f tpcc_local.db tpcc_local.db-journal
-	rm -f tpcc.db tpcc.db-journal
+	rm -f tpcc_local.db tpcc_local.db-journal tpcc_local.db-wal tpcc_local.db-shm
+	rm -f tpcc.db tpcc.db-journal tpcc.db-wal tpcc.db-shm
 
 # ---------- Help ----------
 

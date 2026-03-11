@@ -43,6 +43,7 @@ typedef struct {
 /* Benchmark configuration */
 typedef struct {
   int use_azure;
+  int use_wal;
   int num_warehouses;
   int duration_seconds;
   int num_threads;
@@ -112,6 +113,7 @@ static void print_usage(const char *prog) {
   fprintf(stderr, "Options:\n");
   fprintf(stderr, "  --local            Use local SQLite (default VFS)\n");
   fprintf(stderr, "  --azure            Use azqlite (Azure blob-backed VFS)\n");
+  fprintf(stderr, "  --wal              Enable WAL journal mode (requires --azure)\n");
   fprintf(stderr, "  --warehouses N     Number of warehouses (default: 1)\n");
   fprintf(stderr, "  --duration S       Benchmark duration in seconds (default: 60)\n");
   fprintf(stderr, "  --threads N        Number of concurrent threads (default: 1)\n");
@@ -159,6 +161,11 @@ static int run_benchmark(benchmark_config_t *config) {
   printf("\nTPC-C Benchmark Configuration\n");
   printf("=================================================================\n");
   printf("Mode:       %s\n", config->use_azure ? "azure (azqlite VFS)" : "local (default VFS)");
+  if (config->use_wal) {
+    printf("Journal:    WAL (write-ahead logging)\n");
+  } else {
+    printf("Journal:    DELETE (rollback journal)\n");
+  }
   printf("Warehouses: %d\n", config->num_warehouses);
   printf("Duration:   %d seconds\n", config->duration_seconds);
   printf("Threads:    %d\n", config->num_threads);
@@ -193,8 +200,48 @@ static int run_benchmark(benchmark_config_t *config) {
     return 1;
   }
   
+  /* Set journal mode */
+  if (config->use_wal) {
+    char *errmsg = NULL;
+
+    rc = sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE;", NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+      fprintf(stderr, "Failed to set locking_mode=EXCLUSIVE: %s\n",
+              errmsg ? errmsg : sqlite3_errmsg(db));
+      sqlite3_free(errmsg);
+      sqlite3_close(db);
+      return 1;
+    }
+
+    /* Switch to WAL journal mode and verify */
+    sqlite3_stmt *jstmt = NULL;
+    rc = sqlite3_prepare_v2(db, "PRAGMA journal_mode=WAL;", -1, &jstmt, NULL);
+    if (rc != SQLITE_OK) {
+      fprintf(stderr, "Failed to prepare journal_mode pragma: %s\n", sqlite3_errmsg(db));
+      sqlite3_close(db);
+      return 1;
+    }
+    const char *jmode = NULL;
+    if (sqlite3_step(jstmt) == SQLITE_ROW) {
+      jmode = (const char *)sqlite3_column_text(jstmt, 0);
+    }
+    if (!jmode || strcmp(jmode, "wal") != 0) {
+      fprintf(stderr, "Failed to enable WAL mode (journal_mode is '%s', expected 'wal')\n",
+              jmode ? jmode : "(null)");
+      sqlite3_finalize(jstmt);
+      sqlite3_close(db);
+      return 1;
+    }
+    sqlite3_finalize(jstmt);
+    printf("WAL mode enabled\n");
+  } else {
+    rc = sqlite3_exec(db, "PRAGMA journal_mode=DELETE;", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+      fprintf(stderr, "Warning: failed to set journal_mode=DELETE: %s\n", sqlite3_errmsg(db));
+    }
+  }
+
   /* Set pragmas for performance */
-  sqlite3_exec(db, "PRAGMA journal_mode=DELETE", NULL, NULL, NULL);
   sqlite3_exec(db, "PRAGMA synchronous=NORMAL", NULL, NULL, NULL);
   sqlite3_exec(db, "PRAGMA cache_size=10000", NULL, NULL, NULL);
   
@@ -347,6 +394,7 @@ static int run_benchmark(benchmark_config_t *config) {
   printf("\nTPC-C Benchmark Results\n");
   printf("=================================================================\n");
   printf("Mode:       %s\n", config->use_azure ? "azure (azqlite VFS)" : "local (default VFS)");
+  printf("Journal:    %s\n", config->use_wal ? "WAL" : "DELETE");
   printf("Warehouses: %d\n", config->num_warehouses);
   printf("Duration:   %.1f seconds\n", elapsed);
   printf("Threads:    %d\n", config->num_threads);
@@ -467,6 +515,8 @@ int main(int argc, char **argv) {
       }
     } else if (strcmp(argv[i], "--reload") == 0) {
       config.force_reload = 1;
+    } else if (strcmp(argv[i], "--wal") == 0) {
+      config.use_wal = 1;
     } else if (strcmp(argv[i], "--skip-load") == 0) {
       config.skip_load = 1;
     } else if (strcmp(argv[i], "--help") == 0) {
@@ -479,6 +529,12 @@ int main(int argc, char **argv) {
     }
   }
   
+  /* Validate --wal requires --azure */
+  if (config.use_wal && !config.use_azure) {
+    fprintf(stderr, "Error: --wal requires --azure (WAL mode is only meaningful for Azure VFS)\n");
+    return 1;
+  }
+
   /* Set database path */
   if (config.use_azure) {
     if (!check_azure_env()) {
