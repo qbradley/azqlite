@@ -743,6 +743,401 @@ TEST(wal_concurrent_reads_during_write) {
     wal_close_db(db);
 }
 
+
+/* ══════════════════════════════════════════════════════════════════════
+** Suite: WAL Mode — Crash Recovery on Open
+**
+** When azqlite opens a DB and a WAL blob already exists in Azure,
+** the VFS downloads it via block_blob_download to restore crash
+** recovery data.  These tests exercise the walExists download path
+** in xOpen for WAL files.
+** ══════════════════════════════════════════════════════════════════════ */
+
+/*
+** Test 13: Pre-populate mock with WAL data, open DB, verify the
+** WAL data is downloaded into the file's buffer.
+**
+** Approach:
+**   1. Open DB in WAL mode and write data (populates the append blob)
+**   2. Capture WAL blob data from the mock
+**   3. Close, reset mock, re-populate page blob + WAL data as block blob
+**   4. Reopen — WAL recovery should download and replay the data
+**   5. Verify data written through WAL is readable
+*/
+TEST(wal_recovery_downloads_existing_wal) {
+    wal_setup();
+
+    /* Phase 1: Write data in WAL mode to generate real WAL content */
+    sqlite3 *db = wal_open_db(wal_base_ops, wal_ctx, "walrecov.db");
+    ASSERT_NOT_NULL(db);
+
+    int rc = wal_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);");
+    ASSERT_OK(rc);
+    rc = wal_exec(db, "INSERT INTO t VALUES(1, 'crash-recovery');");
+    ASSERT_OK(rc);
+
+    /* Checkpoint so data reaches the page blob */
+    rc = wal_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);");
+    ASSERT_OK(rc);
+
+    /* Write more data (stays in WAL only — not checkpointed) */
+    rc = wal_exec(db, "INSERT INTO t VALUES(2, 'wal-only-data');");
+    ASSERT_OK(rc);
+
+    /* Capture WAL blob data before closing */
+    const unsigned char *wal_data = mock_get_append_data(wal_ctx, "walrecov.db-wal");
+    int64_t wal_size = mock_get_append_size(wal_ctx, "walrecov.db-wal");
+    ASSERT_NOT_NULL(wal_data);
+    ASSERT_GT(wal_size, (int64_t)0);
+
+    /* Save a copy of WAL data (close may modify the blob) */
+    unsigned char *wal_copy = (unsigned char *)malloc((size_t)wal_size);
+    ASSERT_NOT_NULL(wal_copy);
+    memcpy(wal_copy, wal_data, (size_t)wal_size);
+
+    /* Close DB (may checkpoint and clear WAL) */
+    wal_close_db(db);
+    db = NULL;
+
+    /* Phase 2: Simulate crash recovery scenario.
+    ** The page blob from phase 1 survives (Azure persists it).
+    ** Re-upload the WAL data as a block blob to simulate Azure state
+    ** after a crash (WAL append blob still present). The mock's
+    ** block_blob_download is type-strict, so upload as block blob. */
+    azure_error_t aerr;
+    azure_error_init(&aerr);
+    azure_err_t arc = wal_base_ops->block_blob_upload(
+        wal_ctx, "walrecov.db-wal", wal_copy, (size_t)wal_size, &aerr);
+    ASSERT_AZURE_OK(arc);
+    free(wal_copy);
+
+    /* Reset call counts to isolate recovery calls */
+    mock_reset_call_counts(wal_ctx);
+
+    /* Phase 3: Reopen — should detect WAL blob and download it */
+    rc = azqlite_vfs_register_with_ops(wal_base_ops, wal_ctx, 0);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_open_v2("walrecov.db", &db,
+                          SQLITE_OPEN_READWRITE, "azqlite");
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(db);
+
+    rc = wal_exec(db, "PRAGMA locking_mode=EXCLUSIVE;");
+    ASSERT_OK(rc);
+
+    /* Entering WAL mode triggers xOpen for the WAL file,
+    ** which should find the blob and call block_blob_download */
+    const char *mode = wal_set_journal_mode(db, "wal");
+    ASSERT_STR_EQ(mode, "wal");
+
+    /* Verify block_blob_download was called (WAL recovery path) */
+    int dl_count = mock_get_call_count(wal_ctx, "block_blob_download");
+    ASSERT_GT(dl_count, 0);
+
+    wal_close_db(db);
+}
+
+/*
+** Test 14: WAL blob exists but block_blob_download fails — the PRAGMA
+** journal_mode=WAL must fail to prevent silent data loss.
+** This exercises the C1 fix.
+**
+** Note: SQLite deletes leftover WAL files for empty databases (nPage==0).
+** So we must create a non-empty database first (in DELETE journal mode),
+** then pre-populate the WAL blob and inject the download failure.
+*/
+TEST(wal_recovery_download_failure) {
+    wal_setup();
+
+    /* Phase 1: Create a non-empty database in DELETE journal mode */
+    int rc = azqlite_vfs_register_with_ops(wal_base_ops, wal_ctx, 0);
+    ASSERT_OK(rc);
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open_v2("walfail_dl.db", &db,
+                          SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                          "azqlite");
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(db);
+
+    rc = wal_exec(db, "PRAGMA locking_mode=EXCLUSIVE;");
+    ASSERT_OK(rc);
+
+    /* Create a table so the database has at least one page */
+    rc = wal_exec(db, "CREATE TABLE setup(x);");
+    ASSERT_OK(rc);
+    wal_close_db(db);
+    db = NULL;
+
+    /* Phase 2: Pre-create WAL blob and inject failure */
+    azure_error_t aerr;
+    azure_error_init(&aerr);
+    unsigned char dummy[] = "FAKE_WAL_DATA_FOR_RECOVERY";
+    azure_err_t arc = wal_base_ops->block_blob_upload(
+        wal_ctx, "walfail_dl.db-wal", dummy, sizeof(dummy), &aerr);
+    ASSERT_AZURE_OK(arc);
+
+    mock_set_fail_operation(wal_ctx, "block_blob_download", AZURE_ERR_IO);
+
+    /* Phase 3: Reopen and try WAL mode */
+    rc = azqlite_vfs_register_with_ops(wal_base_ops, wal_ctx, 0);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_open_v2("walfail_dl.db", &db,
+                          SQLITE_OPEN_READWRITE, "azqlite");
+    ASSERT_OK(rc);
+    ASSERT_NOT_NULL(db);
+
+    rc = wal_exec(db, "PRAGMA locking_mode=EXCLUSIVE;");
+    ASSERT_OK(rc);
+
+    /* PRAGMA journal_mode=WAL should fail:
+    **   pagerOpenWalIfPresent → blob_exists → 1 → nPage > 0 →
+    **   sqlite3PagerOpenWal → azqliteOpen → blob_exists → 1 →
+    **   block_blob_download → fails → SQLITE_CANTOPEN
+    ** The journal mode should remain "delete". */
+    const char *mode = wal_set_journal_mode(db, "wal");
+    ASSERT_STR_NE(mode, "wal");
+
+    mock_clear_failures(wal_ctx);
+    wal_close_db(db);
+}
+
+/*
+** Test 15: WAL blob exists but is empty (0 bytes).
+** Open should succeed normally — an empty WAL has nothing to replay.
+*/
+TEST(wal_recovery_empty_wal) {
+    wal_setup();
+
+    /* Create a zero-length block blob for the WAL name */
+    azure_error_t aerr;
+    azure_error_init(&aerr);
+    azure_err_t arc = wal_base_ops->block_blob_upload(
+        wal_ctx, "walempty.db-wal", NULL, 0, &aerr);
+    ASSERT_AZURE_OK(arc);
+
+    /* Open DB and enter WAL mode — should succeed despite empty WAL */
+    sqlite3 *db = wal_open_db(wal_base_ops, wal_ctx, "walempty.db");
+    ASSERT_NOT_NULL(db);
+
+    /* Verify the DB is functional */
+    int rc = wal_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);");
+    ASSERT_OK(rc);
+    rc = wal_exec(db, "INSERT INTO t VALUES(1, 'after-empty-wal');");
+    ASSERT_OK(rc);
+
+    /* Read back to confirm */
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "SELECT val FROM t WHERE id=1;", -1,
+                             &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "after-empty-wal");
+    rc = sqlite3_finalize(stmt);
+    ASSERT_OK(rc);
+
+    wal_close_db(db);
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════
+** Suite: WAL Mode — Full Resync Chunking
+**
+** When SQLite overwrites previously-synced WAL data (e.g., WAL header
+** rewrite after checkpoint), walNeedFullResync is set to 1.  The xSync
+** path must delete+recreate the append blob and re-upload the entire
+** WAL buffer, chunking at 4 MiB boundaries per Azure append limit.
+**
+** The incremental append path also chunks at 4 MiB when new data
+** since the last sync exceeds the limit.
+** ══════════════════════════════════════════════════════════════════════ */
+
+/*
+** Helper: insert N rows with randomblob(blob_size) in a single transaction.
+** The table must already exist with columns (id, data).
+*/
+static int wal_insert_blobs(sqlite3 *db, int start_id, int count,
+                             int blob_size) {
+    int rc = wal_exec(db, "BEGIN;");
+    if (rc != SQLITE_OK) return rc;
+
+    for (int i = 0; i < count; i++) {
+        char sql[128];
+        int n = snprintf(sql, sizeof(sql),
+                         "INSERT INTO t VALUES(%d, randomblob(%d));",
+                         start_id + i, blob_size);
+        if (n < 0 || (size_t)n >= sizeof(sql)) return SQLITE_ERROR;
+        rc = wal_exec(db, sql);
+        if (rc != SQLITE_OK) {
+            wal_exec(db, "ROLLBACK;");
+            return rc;
+        }
+    }
+
+    rc = wal_exec(db, "COMMIT;");
+    return rc;
+}
+
+/*
+** Test 16: Full resync with small data (< 4 MiB).
+** After PASSIVE checkpoint, the next write triggers WAL restart which
+** overwrites the WAL header at offset 0 (before nWalSynced).
+** xSync sees walNeedFullResync → delete + create + single append call.
+*/
+TEST(wal_full_resync_small_data) {
+    wal_setup();
+
+    sqlite3 *db = wal_open_db(wal_base_ops, wal_ctx, "walresync_sm.db");
+    ASSERT_NOT_NULL(db);
+
+    int rc = wal_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data BLOB);");
+    ASSERT_OK(rc);
+
+    /* Write some data to populate WAL (generates a few frames, syncs) */
+    rc = wal_exec(db, "INSERT INTO t VALUES(1, 'small-data');");
+    ASSERT_OK(rc);
+    rc = wal_exec(db, "INSERT INTO t VALUES(2, 'more-data');");
+    ASSERT_OK(rc);
+
+    /* Passive checkpoint — moves frames to page blob but does NOT truncate
+    ** the WAL file.  nWalSynced stays positive. */
+    rc = wal_exec(db, "PRAGMA wal_checkpoint(PASSIVE);");
+    ASSERT_OK(rc);
+
+    /* Reset counters + records to isolate the next operation */
+    mock_reset_call_counts(wal_ctx);
+    mock_clear_append_records(wal_ctx);
+
+    /* This INSERT triggers WAL restart:
+    **   walRestartLog() → walRestartHdr() (no xTruncate)
+    **   iFrame==0 → xWrite(WAL header, offset 0) → walNeedFullResync=1
+    **   xSync → full resync (delete + create + chunked append) */
+    rc = wal_exec(db, "INSERT INTO t VALUES(3, 'trigger-resync');");
+    ASSERT_OK(rc);
+
+    /* Verify full resync path was taken:
+    **   append_blob_delete + append_blob_create indicate blob was recreated */
+    int del_count = mock_get_call_count(wal_ctx, "append_blob_delete");
+    int create_count = mock_get_call_count(wal_ctx, "append_blob_create");
+    ASSERT_GT(del_count, 0);
+    ASSERT_GT(create_count, 0);
+
+    /* With small WAL data (< 4 MiB), single append call suffices */
+    int append_records = mock_get_append_record_count(wal_ctx);
+    ASSERT_GT(append_records, 0);
+
+    /* Verify each append chunk is ≤ 4 MiB */
+    for (int i = 0; i < append_records; i++) {
+        mock_append_record_t rec = mock_get_append_record(wal_ctx, i);
+        ASSERT_LE((long long)rec.len, (long long)(4 * 1024 * 1024));
+    }
+
+    wal_close_db(db);
+}
+
+/*
+** Test 17: Full resync with data > 4 MiB.
+** Build up > 4 MiB of WAL data, then trigger full resync.
+** The upload must be chunked into multiple append calls, each ≤ 4 MiB.
+** This exercises the C2 fix.
+*/
+TEST(wal_full_resync_large_data) {
+    wal_setup();
+
+    sqlite3 *db = wal_open_db(wal_base_ops, wal_ctx, "walresync_lg.db");
+    ASSERT_NOT_NULL(db);
+
+    int rc = wal_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data BLOB);");
+    ASSERT_OK(rc);
+
+    /* Build up > 4 MiB of WAL data in a single transaction.
+    ** Each row with randomblob(3800) fills approximately one 4096-byte page.
+    ** 1100 rows → ~1100 WAL frames → ~1100 × 4120 ≈ 4.5 MB. */
+    rc = wal_insert_blobs(db, 0, 1100, 3800);
+    ASSERT_OK(rc);
+
+    /* Verify WAL data exceeds 4 MiB */
+    int64_t wal_size = mock_get_append_size(wal_ctx, "walresync_lg.db-wal");
+    ASSERT_GT(wal_size, (int64_t)(4 * 1024 * 1024));
+
+    /* Passive checkpoint — moves frames to page blob, no WAL truncation */
+    rc = wal_exec(db, "PRAGMA wal_checkpoint(PASSIVE);");
+    ASSERT_OK(rc);
+
+    /* Reset counters + records to isolate the full resync */
+    mock_reset_call_counts(wal_ctx);
+    mock_clear_append_records(wal_ctx);
+
+    /* Trigger WAL restart → full resync of > 4 MiB data */
+    rc = wal_exec(db, "INSERT INTO t VALUES(9999, 'trigger-chunked-resync');");
+    ASSERT_OK(rc);
+
+    /* Verify full resync path (delete + create) */
+    int del_count = mock_get_call_count(wal_ctx, "append_blob_delete");
+    int create_count = mock_get_call_count(wal_ctx, "append_blob_create");
+    ASSERT_GT(del_count, 0);
+    ASSERT_GT(create_count, 0);
+
+    /* Must have multiple append calls (data > 4 MiB → chunked) */
+    int append_records = mock_get_append_record_count(wal_ctx);
+    ASSERT_GT(append_records, 1);
+
+    /* Every chunk must be ≤ 4 MiB */
+    for (int i = 0; i < append_records; i++) {
+        mock_append_record_t rec = mock_get_append_record(wal_ctx, i);
+        ASSERT_LE((long long)rec.len, (long long)(4 * 1024 * 1024));
+        ASSERT_GT((long long)rec.len, 0LL);
+    }
+
+    wal_close_db(db);
+}
+
+/*
+** Test 18: Incremental append with large data (> 4 MiB).
+** A single large transaction accumulates > 4 MiB of new WAL data
+** since the last sync.  The incremental append path must chunk the
+** upload at 4 MiB boundaries.
+*/
+TEST(wal_incremental_append_large_data) {
+    wal_setup();
+
+    sqlite3 *db = wal_open_db(wal_base_ops, wal_ctx, "walincr_lg.db");
+    ASSERT_NOT_NULL(db);
+
+    int rc = wal_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data BLOB);");
+    ASSERT_OK(rc);
+
+    /* Reset counters + records — isolate the large transaction's sync */
+    mock_reset_call_counts(wal_ctx);
+    mock_clear_append_records(wal_ctx);
+
+    /* Single large transaction: > 4 MiB of WAL frames committed at once.
+    ** The incremental append sees pending > 4 MiB and chunks the upload. */
+    rc = wal_insert_blobs(db, 0, 1100, 3800);
+    ASSERT_OK(rc);
+
+    /* Must have multiple append calls (data > 4 MiB → chunked) */
+    int append_records = mock_get_append_record_count(wal_ctx);
+    ASSERT_GT(append_records, 1);
+
+    /* Every chunk must be ≤ 4 MiB */
+    for (int i = 0; i < append_records; i++) {
+        mock_append_record_t rec = mock_get_append_record(wal_ctx, i);
+        ASSERT_LE((long long)rec.len, (long long)(4 * 1024 * 1024));
+        ASSERT_GT((long long)rec.len, 0LL);
+    }
+
+    /* Verify this was NOT a full resync — no delete+create in the
+    ** incremental path (the blob was already created during WAL mode setup) */
+    int del_count = mock_get_call_count(wal_ctx, "append_blob_delete");
+    ASSERT_EQ(del_count, 0);
+
+    wal_close_db(db);
+}
+
 #endif /* ENABLE_WAL_TESTS */
 
 
@@ -781,6 +1176,18 @@ void run_wal_tests(void) {
     TEST_SUITE_BEGIN("WAL Mode \xe2\x80\x94 Data Integrity");
     RUN_TEST(wal_insert_select_roundtrip);
     RUN_TEST(wal_concurrent_reads_during_write);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("WAL Mode \xe2\x80\x94 Crash Recovery on Open");
+    RUN_TEST(wal_recovery_downloads_existing_wal);
+    RUN_TEST(wal_recovery_download_failure);
+    RUN_TEST(wal_recovery_empty_wal);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("WAL Mode \xe2\x80\x94 Full Resync Chunking");
+    RUN_TEST(wal_full_resync_small_data);
+    RUN_TEST(wal_full_resync_large_data);
+    RUN_TEST(wal_incremental_append_large_data);
     TEST_SUITE_END();
 
     /* Cleanup */

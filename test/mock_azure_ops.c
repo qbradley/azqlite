@@ -124,6 +124,10 @@ struct mock_azure_ctx {
     /* Write recording for coalescing tests */
     mock_write_record_t write_records[MOCK_MAX_WRITE_RECORDS];
     int                 write_record_count;
+
+    /* Append call recording for WAL chunking tests */
+    mock_append_record_t append_records[MOCK_MAX_APPEND_RECORDS];
+    int                  append_record_count;
 };
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
@@ -745,6 +749,12 @@ static azure_err_t mock_append_blob_append_impl(void *vctx,
     }
     memcpy(b->data + b->size, data, (size_t)data_len);
     b->size = new_size;
+
+    /* Record this append call for chunking tests */
+    if (ctx->append_record_count < MOCK_MAX_APPEND_RECORDS) {
+        ctx->append_records[ctx->append_record_count++].len = (size_t)data_len;
+    }
+
     return AZURE_OK;
 }
 
@@ -829,6 +839,7 @@ void mock_reset(mock_azure_ctx_t *ctx) {
     ctx->fail_rule_count = 0;
     ctx->next_lease_num = 0;
     ctx->write_record_count = 0;
+    ctx->append_record_count = 0;
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -978,6 +989,26 @@ mock_write_record_t mock_get_write_record(mock_azure_ctx_t *ctx, int idx) {
 void mock_clear_write_records(mock_azure_ctx_t *ctx) {
     if (!ctx) return;
     ctx->write_record_count = 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+** Public API — append call recording
+** ══════════════════════════════════════════════════════════════════════ */
+
+int mock_get_append_record_count(mock_azure_ctx_t *ctx) {
+    if (!ctx) return 0;
+    return ctx->append_record_count;
+}
+
+mock_append_record_t mock_get_append_record(mock_azure_ctx_t *ctx, int idx) {
+    mock_append_record_t empty = {0};
+    if (!ctx || idx < 0 || idx >= ctx->append_record_count) return empty;
+    return ctx->append_records[idx];
+}
+
+void mock_clear_append_records(mock_azure_ctx_t *ctx) {
+    if (!ctx) return;
+    ctx->append_record_count = 0;
 }
 
 /* ══════════════════════════════════════════════════════════════════════

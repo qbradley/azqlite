@@ -160,6 +160,26 @@ mock_write_record_t mock_get_write_record(mock_azure_ctx_t *ctx, int idx);
 void mock_clear_write_records(mock_azure_ctx_t *ctx);
 
 /* ══════════════════════════════════════════════════════════════════════
+** Append call recording — tracks append_blob_append data lengths
+** for chunking tests (4 MiB boundary verification)
+** ══════════════════════════════════════════════════════════════════════ */
+
+#define MOCK_MAX_APPEND_RECORDS 1024
+
+typedef struct {
+    size_t  len;
+} mock_append_record_t;
+
+/* Get the number of recorded append_blob_append calls since last clear. */
+int mock_get_append_record_count(mock_azure_ctx_t *ctx);
+
+/* Get a specific append record (0-based). Returns zeroed record if out of range. */
+mock_append_record_t mock_get_append_record(mock_azure_ctx_t *ctx, int idx);
+
+/* Clear all append records. Also called by mock_reset(). */
+void mock_clear_append_records(mock_azure_ctx_t *ctx);
+
+/* ══════════════════════════════════════════════════════════════════════
 ** Append blob state inspection (for WAL mode tests)
 ** ══════════════════════════════════════════════════════════════════════ */
 
