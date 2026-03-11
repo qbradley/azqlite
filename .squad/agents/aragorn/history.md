@@ -282,3 +282,15 @@ export AZURE_STORAGE_ACCOUNT=...
 - `lastSyncDirtyCount` starts at 0, so first transaction always gets 30s lease. Only after a heavy sync does the next lock request extend to 60s. This is conservative and correct.
 - `leaseDuration` field tracks what was actually acquired, so renewal threshold adjusts proportionally (30s→renew@15s, 60s→renew@30s).
 - `AZQLITE_LEASE_RENEW_AFTER` kept as fallback constant but no longer primary — `leaseDuration / 2` is the source of truth.
+
+### R1+R2 Performance Optimizations (2026-03-11)
+
+Implemented two optimizations from the performance diagnosis (aragorn-perf-diagnosis.md):
+
+**R1: Journal/WAL blob existence cache** — Added `journalCacheState` (-1/0/1) and `journalBlobName[512]` to `azqliteVfsData`. Cache is seeded on first xAccess (detects `-journal` suffix per D7) or xOpen of journal blob. Updated on xSync(journal)→1, xDelete(journal)→0. xAccess returns cached state for known journal blobs. WAL files always return 0 (iVersion=1, WAL disabled). Also added `pVfsData` back-pointer to `azqliteFile` for cache access from file-level methods. Reduces ~4 HEAD requests per transaction to ~0 after startup.
+
+**R2: Skip redundant resize** — Added `lastSyncedSize` to `azqliteFile`. `azqliteSync` only calls `page_blob_resize` when `nData > lastSyncedSize`. Updated after successful resize, after xOpen download, and after xTruncate. Most TPC-C transactions modify existing pages without growing, saving ~45ms per transaction.
+
+**Test updates:** Two tests adjusted for R2 behavior — `vfs_lease_expire_during_sync` now fails `page_blob_write` (resize may not be called), `vfs_sync_resize_failure_before_flush` inserts zeroblob(65536) to force DB growth.
+
+**Result:** TPC-C Azure throughput: 2.9 tps → 5.0 tps (~72% improvement). All 207 unit tests pass.
