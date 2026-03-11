@@ -1,0 +1,430 @@
+/*
+** tpcc.c - TPC-C OLTP Benchmark for SQLite
+**
+** Measures OLTP performance against local SQLite vs azqlite (Azure blob-backed)
+**
+** Usage:
+**   ./tpcc --local --warehouses 1 --duration 60
+**   ./tpcc --azure --warehouses 2 --duration 120
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include "sqlite3.h"
+#include "tpcc_schema.h"
+
+/* Forward declarations from other TPC-C modules */
+extern int tpcc_load_data(sqlite3 *db, int num_warehouses);
+
+typedef struct {
+  int success;
+  char error_msg[256];
+} txn_result_t;
+
+extern txn_result_t tpcc_new_order_txn(sqlite3 *db, int w_id, int num_warehouses);
+extern txn_result_t tpcc_payment_txn(sqlite3 *db, int w_id, int num_warehouses);
+extern txn_result_t tpcc_order_status_txn(sqlite3 *db, int w_id, int num_warehouses);
+
+/* Transaction statistics */
+typedef struct {
+  int count;
+  int failures;
+  double total_latency_ms;
+  double min_latency_ms;
+  double max_latency_ms;
+  double *latencies; /* Array for percentile calculation */
+  int latency_capacity;
+} txn_stats_t;
+
+/* Benchmark configuration */
+typedef struct {
+  int use_azure;
+  int num_warehouses;
+  int duration_seconds;
+  int num_threads;
+  char *db_path;
+} benchmark_config_t;
+
+/* Initialize transaction stats */
+static void init_stats(txn_stats_t *stats) {
+  memset(stats, 0, sizeof(txn_stats_t));
+  stats->min_latency_ms = 999999.0;
+  stats->latency_capacity = 100000;
+  stats->latencies = malloc(sizeof(double) * stats->latency_capacity);
+}
+
+/* Record a transaction latency */
+static void record_latency(txn_stats_t *stats, double latency_ms, int success) {
+  stats->count++;
+  if (!success) {
+    stats->failures++;
+    return;
+  }
+  
+  stats->total_latency_ms += latency_ms;
+  if (latency_ms < stats->min_latency_ms) stats->min_latency_ms = latency_ms;
+  if (latency_ms > stats->max_latency_ms) stats->max_latency_ms = latency_ms;
+  
+  /* Store for percentile calculation */
+  if (stats->count - stats->failures - 1 < stats->latency_capacity) {
+    stats->latencies[stats->count - stats->failures - 1] = latency_ms;
+  }
+}
+
+/* Comparison function for qsort */
+static int compare_double(const void *a, const void *b) {
+  double diff = *(double*)a - *(double*)b;
+  return (diff > 0) - (diff < 0);
+}
+
+/* Get percentile from latency array */
+static double get_percentile(txn_stats_t *stats, double percentile) {
+  if (stats->count - stats->failures <= 0) return 0.0;
+  
+  int n = stats->count - stats->failures;
+  if (n > stats->latency_capacity) n = stats->latency_capacity;
+  
+  qsort(stats->latencies, n, sizeof(double), compare_double);
+  
+  int idx = (int)(n * percentile / 100.0);
+  if (idx >= n) idx = n - 1;
+  
+  return stats->latencies[idx];
+}
+
+/* Get current time in milliseconds */
+static double get_time_ms(void) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+/* Print usage */
+static void print_usage(const char *prog) {
+  fprintf(stderr, "Usage: %s [options]\n", prog);
+  fprintf(stderr, "\n");
+  fprintf(stderr, "Options:\n");
+  fprintf(stderr, "  --local            Use local SQLite (default VFS)\n");
+  fprintf(stderr, "  --azure            Use azqlite (Azure blob-backed VFS)\n");
+  fprintf(stderr, "  --warehouses N     Number of warehouses (default: 1)\n");
+  fprintf(stderr, "  --duration S       Benchmark duration in seconds (default: 60)\n");
+  fprintf(stderr, "  --threads N        Number of concurrent threads (default: 1)\n");
+  fprintf(stderr, "  --help             Show this help message\n");
+  fprintf(stderr, "\n");
+  fprintf(stderr, "For Azure mode, set these environment variables:\n");
+  fprintf(stderr, "  AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_CONTAINER\n");
+  fprintf(stderr, "  AZURE_STORAGE_KEY (or AZURE_STORAGE_SAS)\n");
+}
+
+/* Check Azure environment */
+static int check_azure_env(void) {
+  const char *account = getenv("AZURE_STORAGE_ACCOUNT");
+  const char *container = getenv("AZURE_STORAGE_CONTAINER");
+  const char *key = getenv("AZURE_STORAGE_KEY");
+  const char *sas = getenv("AZURE_STORAGE_SAS");
+  
+  if (!account || !container) {
+    fprintf(stderr, "Error: AZURE_STORAGE_ACCOUNT and AZURE_STORAGE_CONTAINER required\n");
+    return 0;
+  }
+  
+  if (!key && !sas) {
+    fprintf(stderr, "Error: AZURE_STORAGE_KEY or AZURE_STORAGE_SAS required\n");
+    return 0;
+  }
+  
+  return 1;
+}
+
+/* Run benchmark */
+static int run_benchmark(benchmark_config_t *config) {
+  sqlite3 *db = NULL;
+  int rc;
+  txn_stats_t neworder_stats, payment_stats, orderstatus_stats;
+  double start_time, end_time, elapsed;
+  int total_txns = 0;
+  
+  init_stats(&neworder_stats);
+  init_stats(&payment_stats);
+  init_stats(&orderstatus_stats);
+  
+  printf("\nTPC-C Benchmark Configuration\n");
+  printf("=================================================================\n");
+  printf("Mode:       %s\n", config->use_azure ? "azure (azqlite VFS)" : "local (default VFS)");
+  printf("Warehouses: %d\n", config->num_warehouses);
+  printf("Duration:   %d seconds\n", config->duration_seconds);
+  printf("Threads:    %d\n", config->num_threads);
+  printf("Database:   %s\n", config->db_path);
+  printf("=================================================================\n");
+  
+  /* Open database */
+  if (config->use_azure) {
+#ifdef AZQLITE_VFS_AVAILABLE
+    /* Register azqlite VFS */
+    extern int azqlite_vfs_register(void);
+    rc = azqlite_vfs_register();
+    if (rc != SQLITE_OK) {
+      fprintf(stderr, "Failed to register azqlite VFS\n");
+      return 1;
+    }
+    
+    rc = sqlite3_open_v2(config->db_path, &db, 
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                         "azqlite");
+#else
+    fprintf(stderr, "Error: Azure mode requested but binary not built with Azure support\n");
+    fprintf(stderr, "Build with 'make all-production' to enable Azure mode\n");
+    return 1;
+#endif
+  } else {
+    rc = sqlite3_open(config->db_path, &db);
+  }
+  
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Failed to open database: %s\n", sqlite3_errmsg(db));
+    return 1;
+  }
+  
+  /* Set pragmas for performance */
+  sqlite3_exec(db, "PRAGMA journal_mode=DELETE", NULL, NULL, NULL);
+  sqlite3_exec(db, "PRAGMA synchronous=NORMAL", NULL, NULL, NULL);
+  sqlite3_exec(db, "PRAGMA cache_size=10000", NULL, NULL, NULL);
+  
+  /* Check if database is empty (needs loading) */
+  sqlite3_stmt *stmt = NULL;
+  rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table'", -1, &stmt, NULL);
+  int table_count = 0;
+  if (rc == SQLITE_OK) {
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+      table_count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+  }
+  
+  if (table_count == 0) {
+    printf("\nCreating schema...\n");
+    rc = sqlite3_exec(db, TPCC_CREATE_TABLES, NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+      fprintf(stderr, "Failed to create tables: %s\n", sqlite3_errmsg(db));
+      sqlite3_close(db);
+      return 1;
+    }
+    
+    printf("Loading data...\n");
+    rc = tpcc_load_data(db, config->num_warehouses);
+    if (rc != SQLITE_OK) {
+      fprintf(stderr, "Failed to load data\n");
+      sqlite3_close(db);
+      return 1;
+    }
+  } else {
+    printf("\nUsing existing database (skipping data load)\n");
+  }
+  
+  printf("\nStarting benchmark run...\n");
+  printf("=================================================================\n");
+  
+  srand(time(NULL));
+  start_time = get_time_ms();
+  end_time = start_time + (config->duration_seconds * 1000.0);
+  
+  /* Main benchmark loop */
+  while (get_time_ms() < end_time) {
+    int txn_type = rand() % 100;
+    int w_id = rand() % config->num_warehouses + 1;
+    double txn_start, txn_end, latency;
+    txn_result_t result;
+    
+    txn_start = get_time_ms();
+    
+    if (txn_type < TPCC_MIX_NEWORDER) {
+      /* New Order (45%) */
+      result = tpcc_new_order_txn(db, w_id, config->num_warehouses);
+      txn_end = get_time_ms();
+      latency = txn_end - txn_start;
+      record_latency(&neworder_stats, latency, result.success);
+      
+      if (!result.success && neworder_stats.failures <= 5) {
+        fprintf(stderr, "New Order failed: %s\n", result.error_msg);
+      }
+    } else if (txn_type < TPCC_MIX_NEWORDER + TPCC_MIX_PAYMENT) {
+      /* Payment (43%) */
+      result = tpcc_payment_txn(db, w_id, config->num_warehouses);
+      txn_end = get_time_ms();
+      latency = txn_end - txn_start;
+      record_latency(&payment_stats, latency, result.success);
+      
+      if (!result.success && payment_stats.failures <= 5) {
+        fprintf(stderr, "Payment failed: %s\n", result.error_msg);
+      }
+    } else {
+      /* Order Status (4%) - rest is simplified to just these 3 */
+      result = tpcc_order_status_txn(db, w_id, config->num_warehouses);
+      txn_end = get_time_ms();
+      latency = txn_end - txn_start;
+      record_latency(&orderstatus_stats, latency, result.success);
+      
+      if (!result.success && orderstatus_stats.failures <= 5) {
+        fprintf(stderr, "Order Status failed: %s\n", result.error_msg);
+      }
+    }
+    
+    total_txns++;
+    
+    /* Progress indicator every 100 transactions */
+    if (total_txns % 100 == 0) {
+      printf("  %d transactions...\r", total_txns);
+      fflush(stdout);
+    }
+  }
+  
+  elapsed = (get_time_ms() - start_time) / 1000.0;
+  
+  printf("\n=================================================================\n");
+  printf("\nTPC-C Benchmark Results\n");
+  printf("=================================================================\n");
+  printf("Mode:       %s\n", config->use_azure ? "azure (azqlite VFS)" : "local (default VFS)");
+  printf("Warehouses: %d\n", config->num_warehouses);
+  printf("Duration:   %.1f seconds\n", elapsed);
+  printf("Threads:    %d\n", config->num_threads);
+  printf("\n");
+  
+  int new_success = neworder_stats.count - neworder_stats.failures;
+  int pay_success = payment_stats.count - payment_stats.failures;
+  int ord_success = orderstatus_stats.count - orderstatus_stats.failures;
+  int total_success = new_success + pay_success + ord_success;
+  
+  printf("Transaction Mix:\n");
+  
+  if (neworder_stats.count > 0) {
+    printf("  New Order:    %5d (%4.1f%%)  avg: %6.1fms  p50: %6.1fms  p95: %6.1fms  p99: %6.1fms",
+           new_success,
+           (new_success * 100.0) / total_success,
+           neworder_stats.total_latency_ms / new_success,
+           get_percentile(&neworder_stats, 50),
+           get_percentile(&neworder_stats, 95),
+           get_percentile(&neworder_stats, 99));
+    if (neworder_stats.failures > 0) {
+      printf("  (%d failed)", neworder_stats.failures);
+    }
+    printf("\n");
+  }
+  
+  if (payment_stats.count > 0) {
+    printf("  Payment:      %5d (%4.1f%%)  avg: %6.1fms  p50: %6.1fms  p95: %6.1fms  p99: %6.1fms",
+           pay_success,
+           (pay_success * 100.0) / total_success,
+           payment_stats.total_latency_ms / pay_success,
+           get_percentile(&payment_stats, 50),
+           get_percentile(&payment_stats, 95),
+           get_percentile(&payment_stats, 99));
+    if (payment_stats.failures > 0) {
+      printf("  (%d failed)", payment_stats.failures);
+    }
+    printf("\n");
+  }
+  
+  if (orderstatus_stats.count > 0) {
+    printf("  Order Status: %5d (%4.1f%%)  avg: %6.1fms  p50: %6.1fms  p95: %6.1fms  p99: %6.1fms",
+           ord_success,
+           (ord_success * 100.0) / total_success,
+           orderstatus_stats.total_latency_ms / ord_success,
+           get_percentile(&orderstatus_stats, 50),
+           get_percentile(&orderstatus_stats, 95),
+           get_percentile(&orderstatus_stats, 99));
+    if (orderstatus_stats.failures > 0) {
+      printf("  (%d failed)", orderstatus_stats.failures);
+    }
+    printf("\n");
+  }
+  
+  printf("\n");
+  printf("Total:      %5d transactions\n", total_success);
+  printf("Throughput: %.1f tps\n", total_success / elapsed);
+  printf("=================================================================\n");
+  
+  /* Cleanup */
+  free(neworder_stats.latencies);
+  free(payment_stats.latencies);
+  free(orderstatus_stats.latencies);
+  
+  sqlite3_close(db);
+  
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  benchmark_config_t config = {0};
+  
+  /* Defaults */
+  config.num_warehouses = 1;
+  config.duration_seconds = 60;
+  config.num_threads = 1;
+  config.db_path = NULL;
+  
+  /* Parse arguments */
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--local") == 0) {
+      config.use_azure = 0;
+    } else if (strcmp(argv[i], "--azure") == 0) {
+      config.use_azure = 1;
+    } else if (strcmp(argv[i], "--warehouses") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Error: --warehouses requires an argument\n");
+        return 1;
+      }
+      config.num_warehouses = atoi(argv[i]);
+      if (config.num_warehouses <= 0) {
+        fprintf(stderr, "Error: --warehouses must be positive\n");
+        return 1;
+      }
+    } else if (strcmp(argv[i], "--duration") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Error: --duration requires an argument\n");
+        return 1;
+      }
+      config.duration_seconds = atoi(argv[i]);
+      if (config.duration_seconds <= 0) {
+        fprintf(stderr, "Error: --duration must be positive\n");
+        return 1;
+      }
+    } else if (strcmp(argv[i], "--threads") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Error: --threads requires an argument\n");
+        return 1;
+      }
+      config.num_threads = atoi(argv[i]);
+      if (config.num_threads <= 0) {
+        fprintf(stderr, "Error: --threads must be positive\n");
+        return 1;
+      }
+      if (config.num_threads > 1) {
+        fprintf(stderr, "Warning: multi-threading not yet implemented, using 1 thread\n");
+        config.num_threads = 1;
+      }
+    } else if (strcmp(argv[i], "--help") == 0) {
+      print_usage(argv[0]);
+      return 0;
+    } else {
+      fprintf(stderr, "Error: unknown option '%s'\n", argv[i]);
+      print_usage(argv[0]);
+      return 1;
+    }
+  }
+  
+  /* Set database path */
+  if (config.use_azure) {
+    if (!check_azure_env()) {
+      return 1;
+    }
+    config.db_path = "tpcc.db";
+  } else {
+    config.db_path = "tpcc_local.db";
+  }
+  
+  return run_benchmark(&config);
+}
