@@ -43,8 +43,14 @@ int azure_base64_encode(const uint8_t *input, size_t input_len,
     BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
     b64 = BIO_push(b64, mem);
 
-    BIO_write(b64, input, (int)input_len);
-    BIO_flush(b64);
+    if (BIO_write(b64, input, (int)input_len) <= 0) {
+        BIO_free_all(b64);
+        return -1;
+    }
+    if (BIO_flush(b64) <= 0) {
+        BIO_free_all(b64);
+        return -1;
+    }
 
     BUF_MEM *bptr;
     BIO_get_mem_ptr(b64, &bptr);
@@ -173,23 +179,27 @@ azure_err_t azure_auth_sign_request(
      * Date is empty because we always use x-ms-date instead
      * (avoids proxy mangling of the Date header).
      */
-    p += snprintf(p, (size_t)(end - p),
-        "%s\n"    /* VERB */
-        "\n"      /* Content-Encoding */
-        "\n"      /* Content-Language */
-        "%s\n"    /* Content-Length */
-        "\n"      /* Content-MD5 */
-        "%s\n"    /* Content-Type */
-        "\n"      /* Date (empty — using x-ms-date) */
-        "\n"      /* If-Modified-Since */
-        "\n"      /* If-Match */
-        "\n"      /* If-None-Match */
-        "\n"      /* If-Unmodified-Since */
-        "%s\n",   /* Range */
-        method,
-        content_length,
-        content_type,
-        range);
+    {
+        int n = snprintf(p, (size_t)(end - p),
+            "%s\n"    /* VERB */
+            "\n"      /* Content-Encoding */
+            "\n"      /* Content-Language */
+            "%s\n"    /* Content-Length */
+            "\n"      /* Content-MD5 */
+            "%s\n"    /* Content-Type */
+            "\n"      /* Date (empty — using x-ms-date) */
+            "\n"      /* If-Modified-Since */
+            "\n"      /* If-Match */
+            "\n"      /* If-None-Match */
+            "\n"      /* If-Unmodified-Since */
+            "%s\n",   /* Range */
+            method,
+            content_length,
+            content_type,
+            range);
+        if (n < 0 || p + n >= end) return AZURE_ERR_INVALID_ARG;
+        p += n;
+    }
 
     /* Canonicalized headers: sort x-ms-* headers, lowercase name */
     if (x_ms_headers) {
@@ -209,16 +219,15 @@ azure_err_t azure_auth_sign_request(
 
                 /* Write lowercase header name */
                 for (const char *c = h; c < colon; c++) {
-                    if (p < end - 1)
-                        *p++ = (char)tolower((unsigned char)*c);
+                    if (p >= end - 1) { free(sorted); return AZURE_ERR_INVALID_ARG; }
+                    *p++ = (char)tolower((unsigned char)*c);
                 }
                 /* Write :value\n */
                 size_t val_len = strlen(colon);
-                if (p + val_len + 1 < end) {
-                    memcpy(p, colon, val_len);
-                    p += val_len;
-                    *p++ = '\n';
-                }
+                if (p + val_len + 1 >= end) { free(sorted); return AZURE_ERR_INVALID_ARG; }
+                memcpy(p, colon, val_len);
+                p += val_len;
+                *p++ = '\n';
             }
             free(sorted);
         }
@@ -230,7 +239,11 @@ azure_err_t azure_auth_sign_request(
      * For Azurite: path = /account/container/blob (already has account), 
      *              result = /account/account/container/blob (doubled to match Azurite's quirk)
      */
-    p += snprintf(p, (size_t)(end - p), "/%s%s", client->account, path);
+    {
+        int n = snprintf(p, (size_t)(end - p), "/%s%s", client->account, path);
+        if (n < 0 || p + n >= end) return AZURE_ERR_INVALID_ARG;
+        p += n;
+    }
 
     if (query && *query) {
         char qbuf[1024];
@@ -252,10 +265,14 @@ azure_err_t azure_auth_sign_request(
             char *eq = strchr(pairs[i], '=');
             if (eq) {
                 *eq = '\0';
-                p += snprintf(p, (size_t)(end - p), "\n%s:%s",
-                              pairs[i], eq + 1);
+                int n = snprintf(p, (size_t)(end - p), "\n%s:%s",
+                                  pairs[i], eq + 1);
+                if (n < 0 || p + n >= end) return AZURE_ERR_INVALID_ARG;
+                p += n;
             } else {
-                p += snprintf(p, (size_t)(end - p), "\n%s:", pairs[i]);
+                int n = snprintf(p, (size_t)(end - p), "\n%s:", pairs[i]);
+                if (n < 0 || p + n >= end) return AZURE_ERR_INVALID_ARG;
+                p += n;
             }
         }
     }

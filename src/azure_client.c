@@ -19,7 +19,51 @@
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
+#include <limits.h>
+#include <stdint.h>
 #include <curl/curl.h>
+
+/* ================================================================
+ * Secure memory zeroing — guaranteed not to be optimized away (S-C4)
+ *
+ * Uses a volatile function pointer to prevent the compiler from
+ * recognizing and eliminating the memset call as a dead store.
+ * This is the most portable approach across all C compilers.
+ * ================================================================ */
+static void *(*volatile secure_memset)(void *, int, size_t) = memset;
+#define secure_zero(ptr, len) secure_memset((ptr), 0, (len))
+
+/* ================================================================
+ * Thread-safe random for retry jitter (S-H4)
+ * ================================================================ */
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#include <stdlib.h>  /* arc4random_uniform */
+#else
+#include <sys/random.h>  /* getrandom on Linux */
+#endif
+
+/* ================================================================
+ * Safe curl_slist_append macro (S-H5)
+ *
+ * curl_slist_append returns NULL on allocation failure.
+ * When it fails, the previous list has already been freed
+ * internally, so we must set our pointer to NULL to avoid
+ * double-free, then jump to cleanup.
+ * ================================================================ */
+#define SLIST_APPEND(list, str) do { \
+    struct curl_slist *_tmp = curl_slist_append(list, str); \
+    if (!_tmp) { list = NULL; goto cleanup; } \
+    list = _tmp; \
+} while(0)
+
+/* ================================================================
+ * Safe long-to-int clamping for HTTP status codes (S-H7)
+ * ================================================================ */
+static inline int clamp_http_status(long s) {
+    if (s > INT_MAX) return INT_MAX;
+    if (s < INT_MIN) return INT_MIN;
+    return (int)s;
+}
 
 /* ================================================================
  * Debug timing — opt-in via AZQLITE_DEBUG_TIMING=1 env var
@@ -52,9 +96,16 @@ static int g_tls_new_count = 0;
 
 int azure_buffer_append(azure_buffer_t *buf, const uint8_t *data, size_t len)
 {
-    if (buf->size + len > buf->capacity) {
-        size_t new_cap = (buf->capacity == 0) ? 4096 : buf->capacity * 2;
-        while (new_cap < buf->size + len) new_cap *= 2;
+    /* S-C1: overflow check for buf->size + len */
+    if (len > SIZE_MAX - buf->size) return -1;
+    size_t needed = buf->size + len;
+
+    if (needed > buf->capacity) {
+        size_t new_cap = (buf->capacity == 0) ? 4096 : buf->capacity;
+        while (new_cap < needed) {
+            if (new_cap > SIZE_MAX / 2) { new_cap = needed; break; }
+            new_cap *= 2;
+        }
         uint8_t *new_data = realloc(buf->data, new_cap);
         if (!new_data) return -1;
         buf->data = new_data;
@@ -73,6 +124,8 @@ int azure_buffer_append(azure_buffer_t *buf, const uint8_t *data, size_t len)
 static size_t curl_write_cb(void *contents, size_t size, size_t nmemb,
                             void *userp)
 {
+    /* S-C1: overflow check for size * nmemb */
+    if (size != 0 && nmemb > SIZE_MAX / size) return 0;
     size_t real_size = size * nmemb;
     azure_buffer_t *buf = (azure_buffer_t *)userp;
     if (azure_buffer_append(buf, (const uint8_t *)contents, real_size) != 0)
@@ -156,6 +209,38 @@ static size_t curl_header_cb(char *buffer, size_t size, size_t nitems,
 }
 
 /* ================================================================
+ * URI percent-encoding helper (RFC 3986) — S-H12
+ *
+ * Encodes all characters except unreserved (A-Z a-z 0-9 - . _ ~)
+ * and forward slash (/) which is a path separator.
+ * Returns number of bytes written (excluding NUL), or -1 on overflow.
+ * ================================================================ */
+static int uri_encode(const char *input, char *output, size_t output_size)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t j = 0;
+    for (size_t i = 0; input[i]; i++) {
+        unsigned char c = (unsigned char)input[i];
+        int unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                         (c >= '0' && c <= '9') ||
+                         c == '-' || c == '.' || c == '_' || c == '~' ||
+                         c == '/';
+        if (unreserved) {
+            if (j + 1 >= output_size) return -1;
+            output[j++] = (char)c;
+        } else {
+            if (j + 3 >= output_size) return -1;
+            output[j++] = '%';
+            output[j++] = hex[c >> 4];
+            output[j++] = hex[c & 0x0F];
+        }
+    }
+    if (j >= output_size) return -1;
+    output[j] = '\0';
+    return (int)j;
+}
+
+/* ================================================================
  * URL construction
  *
  * Format: https://<account>.blob.core.windows.net/<container>/<blob>
@@ -166,16 +251,23 @@ static void build_blob_url(const azure_client_t *client,
                            const char *blob_name,
                            char *url_buf, size_t url_buf_size)
 {
+    /* S-H12: percent-encode blob name for safe URL construction */
+    char encoded_name[2048];
+    if (uri_encode(blob_name, encoded_name, sizeof(encoded_name)) < 0) {
+        /* Fallback: use raw name if encoding buffer too small */
+        snprintf(encoded_name, sizeof(encoded_name), "%s", blob_name);
+    }
+
     if (client->endpoint[0]) {
         /* Custom endpoint (e.g., Azurite): http://127.0.0.1:10000 
          * Build URL as: endpoint/account/container/blob */
         snprintf(url_buf, url_buf_size, "%s/%s/%s/%s",
-                 client->endpoint, client->account, client->container, blob_name);
+                 client->endpoint, client->account, client->container, encoded_name);
     } else {
         /* Default Azure endpoint */
         snprintf(url_buf, url_buf_size,
                  "https://%s.blob.core.windows.net/%s/%s",
-                 client->account, client->container, blob_name);
+                 client->account, client->container, encoded_name);
     }
 }
 
@@ -300,45 +392,45 @@ static azure_err_t execute_single(
     }
     /* GET is the default */
 
-    /* Build curl header list */
+    /* Build curl header list (S-H5: check every curl_slist_append) */
     struct curl_slist *headers = NULL;
 
     char h_date[256];
     snprintf(h_date, sizeof(h_date), "x-ms-date: %s", date_buf);
-    headers = curl_slist_append(headers, h_date);
+    SLIST_APPEND(headers, h_date);
 
     char h_version[128];
     snprintf(h_version, sizeof(h_version), "x-ms-version: %s",
              AZURE_API_VERSION);
-    headers = curl_slist_append(headers, h_version);
+    SLIST_APPEND(headers, h_version);
 
     if (auth_header[0]) {
         char h_auth[600];
         snprintf(h_auth, sizeof(h_auth), "Authorization: %s", auth_header);
-        headers = curl_slist_append(headers, h_auth);
+        SLIST_APPEND(headers, h_auth);
     }
 
     if (content_type && *content_type) {
         char h_ct[256];
         snprintf(h_ct, sizeof(h_ct), "Content-Type: %s", content_type);
-        headers = curl_slist_append(headers, h_ct);
+        SLIST_APPEND(headers, h_ct);
     } else {
         /* Disable curl's automatic Content-Type header to avoid signature mismatch */
-        headers = curl_slist_append(headers, "Content-Type:");
+        SLIST_APPEND(headers, "Content-Type:");
     }
 
     if (body_len > 0) {
         char h_cl[64];
         snprintf(h_cl, sizeof(h_cl), "Content-Length: %zu", body_len);
-        headers = curl_slist_append(headers, h_cl);
+        SLIST_APPEND(headers, h_cl);
     } else if (strcmp(method, "PUT") == 0) {
-        headers = curl_slist_append(headers, "Content-Length: 0");
+        SLIST_APPEND(headers, "Content-Length: 0");
     }
 
     if (range_header && *range_header) {
         char h_range[256];
         snprintf(h_range, sizeof(h_range), "x-ms-range: %s", range_header);
-        headers = curl_slist_append(headers, h_range);
+        SLIST_APPEND(headers, h_range);
     }
 
     /* Extra x-ms-* headers (blob type, lease action, etc.) */
@@ -353,7 +445,7 @@ static azure_err_t execute_single(
             } else {
                 snprintf(h_extra, sizeof(h_extra), "%s", extra_x_ms[i]);
             }
-            headers = curl_slist_append(headers, h_extra);
+            SLIST_APPEND(headers, h_extra);
         }
     }
 
@@ -399,6 +491,7 @@ static azure_err_t execute_single(
 
     res = curl_easy_perform(curl);
     curl_slist_free_all(headers);
+    headers = NULL;
 
     if (az_debug_timing()) {
         double req_elapsed = az_time_ms() - req_t0;
@@ -436,10 +529,10 @@ static azure_err_t execute_single(
         return AZURE_ERR_CURL;
     }
 
-    /* HTTP status */
+    /* HTTP status (S-H7: clamp long → int to avoid narrowing) */
     long http_status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
-    err->http_status = http_status;
+    err->http_status = clamp_http_status(http_status);
     strncpy(err->request_id, rh->request_id, sizeof(err->request_id) - 1);
 
     if (http_status >= 400) {
@@ -459,6 +552,14 @@ static azure_err_t execute_single(
 
     if (!response_body) azure_buffer_free(&local_buf);
     return AZURE_OK;
+
+/* S-H5: cleanup target for SLIST_APPEND allocation failures */
+cleanup:
+    if (headers) curl_slist_free_all(headers);
+    err->code = AZURE_ERR_NOMEM;
+    snprintf(err->error_message, sizeof(err->error_message),
+             "curl_slist_append allocation failed");
+    return AZURE_ERR_NOMEM;
 }
 
 /* ================================================================
@@ -1033,9 +1134,6 @@ static CURLM *ensure_multi_handle(azure_client_t *c)
     curl_multi_setopt(multi, CURLMOPT_MAXCONNECTS,
                       (long)AZQLITE_MAX_PARALLEL_PUTS);
 
-    /* Seed PRNG once for retry jitter */
-    srand((unsigned)time(NULL));
-
     c->multi_handle = multi;
     return multi;
 }
@@ -1132,36 +1230,37 @@ static azure_err_t batch_init_easy(
         }
     }
 
-    /* ---- HTTP headers (each handle owns its own list) ---- */
+    /* ---- HTTP headers (each handle owns its own list) (S-H5: checked) ---- */
     char h[600];
+    struct curl_slist *list = NULL;
 
     snprintf(h, sizeof(h), "x-ms-date: %s", date_buf);
-    req->hdrs = curl_slist_append(req->hdrs, h);
+    SLIST_APPEND(list, h);
 
     snprintf(h, sizeof(h), "x-ms-version: %s", AZURE_API_VERSION);
-    req->hdrs = curl_slist_append(req->hdrs, h);
+    SLIST_APPEND(list, h);
 
-    req->hdrs = curl_slist_append(req->hdrs, "x-ms-page-write: update");
+    SLIST_APPEND(list, "x-ms-page-write: update");
 
     snprintf(h, sizeof(h), "x-ms-range: %s", range_val);
-    req->hdrs = curl_slist_append(req->hdrs, h);
+    SLIST_APPEND(list, h);
 
     if (lease_id && *lease_id) {
         snprintf(h, sizeof(h), "x-ms-lease-id: %s", lease_id);
-        req->hdrs = curl_slist_append(req->hdrs, h);
+        SLIST_APPEND(list, h);
     }
 
     snprintf(h, sizeof(h), "Content-Length: %zu", range->len);
-    req->hdrs = curl_slist_append(req->hdrs, h);
+    SLIST_APPEND(list, h);
 
-    req->hdrs = curl_slist_append(req->hdrs,
-                                   "Content-Type: application/octet-stream");
+    SLIST_APPEND(list, "Content-Type: application/octet-stream");
 
     if (auth_hdr[0]) {
         snprintf(h, sizeof(h), "Authorization: %s", auth_hdr);
-        req->hdrs = curl_slist_append(req->hdrs, h);
+        SLIST_APPEND(list, h);
     }
 
+    req->hdrs = list;
     curl_easy_setopt(req->easy, CURLOPT_HTTPHEADER, req->hdrs);
 
     /* Response callbacks (per-handle buffers) */
@@ -1185,6 +1284,14 @@ static azure_err_t batch_init_easy(
     curl_easy_setopt(req->easy, CURLOPT_PRIVATE, (char *)req);
 
     return AZURE_OK;
+
+/* S-H5: cleanup for SLIST_APPEND failures in batch_init_easy */
+cleanup:
+    if (list) curl_slist_free_all(list);
+    req->hdrs = NULL;
+    curl_easy_cleanup(req->easy);
+    req->easy = NULL;
+    return AZURE_ERR_NOMEM;
 }
 
 /* Free all resources owned by a batch request */
@@ -1273,7 +1380,15 @@ static azure_err_t az_page_blob_write_batch(
             int delay_ms = AZURE_RETRY_BASE_MS * (1 << (attempt - 1));
             if (delay_ms > AZURE_RETRY_MAX_MS)
                 delay_ms = AZURE_RETRY_MAX_MS;
-            delay_ms += rand() % 100;
+#if defined(__APPLE__) || defined(__FreeBSD__)
+            delay_ms += (int)arc4random_uniform(100);
+#else
+            {
+                unsigned int r;
+                if (getrandom(&r, sizeof(r), 0) == (ssize_t)sizeof(r))
+                    delay_ms += (int)(r % 100);
+            }
+#endif
             fprintf(stderr,
                     "[azqlite] batch write: %d/%d ranges pending, "
                     "retry %d/%d in %dms\n",
@@ -1387,7 +1502,7 @@ static azure_err_t az_page_blob_write_batch(
                     http_status, req->resp_hdrs.error_code);
                 if (attempt_err == AZURE_OK) {
                     attempt_err = rc;
-                    err->http_status = (int)http_status;
+                    err->http_status = clamp_http_status(http_status);
                     if (req->resp_body.size > 0)
                         azure_parse_error_xml(
                             (const char *)req->resp_body.data,
@@ -1711,8 +1826,8 @@ azure_err_t azure_client_create(const azure_client_config_t *config,
             snprintf(err->error_message, sizeof(err->error_message),
                      "curl_easy_init() failed");
         }
-        memset(c->key_raw, 0, sizeof(c->key_raw));
-        memset(c->key_b64, 0, sizeof(c->key_b64));
+        secure_zero(c->key_raw, sizeof(c->key_raw));
+        secure_zero(c->key_b64, sizeof(c->key_b64));
         free(c);
         return AZURE_ERR_NETWORK;
     }
@@ -1740,10 +1855,10 @@ void azure_client_destroy(azure_client_t *client)
         client->curl_handle = NULL;
     }
 
-    /* Scrub key material from memory */
-    memset(client->key_raw, 0, sizeof(client->key_raw));
-    memset(client->key_b64, 0, sizeof(client->key_b64));
-    memset(client->sas_token, 0, sizeof(client->sas_token));
+    /* Scrub key material from memory (S-C4: secure_zero cannot be optimized away) */
+    secure_zero(client->key_raw, sizeof(client->key_raw));
+    secure_zero(client->key_b64, sizeof(client->key_b64));
+    secure_zero(client->sas_token, sizeof(client->sas_token));
 
     free(client);
 }
@@ -1855,24 +1970,24 @@ azure_err_t azure_container_create(azure_client_t *client,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);
 
-    /* Build headers */
+    /* Build headers (S-H5: checked) */
     struct curl_slist *headers = NULL;
     char h_date[256];
     snprintf(h_date, sizeof(h_date), "x-ms-date: %s", date_buf);
-    headers = curl_slist_append(headers, h_date);
+    SLIST_APPEND(headers, h_date);
 
     char h_version[128];
     snprintf(h_version, sizeof(h_version), "x-ms-version: %s", AZURE_API_VERSION);
-    headers = curl_slist_append(headers, h_version);
+    SLIST_APPEND(headers, h_version);
 
     if (auth_header[0]) {
         char h_auth[600];
         snprintf(h_auth, sizeof(h_auth), "Authorization: %s", auth_header);
-        headers = curl_slist_append(headers, h_auth);
+        SLIST_APPEND(headers, h_auth);
     }
 
-    headers = curl_slist_append(headers, "Content-Length: 0");
-    headers = curl_slist_append(headers, "Content-Type:");
+    SLIST_APPEND(headers, "Content-Length: 0");
+    SLIST_APPEND(headers, "Content-Type:");
 
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
@@ -1890,6 +2005,7 @@ azure_err_t azure_container_create(azure_client_t *client,
     /* Execute */
     res = curl_easy_perform(curl);
     curl_slist_free_all(headers);
+    headers = NULL;
 
     if (res != CURLE_OK) {
         err->code = AZURE_ERR_NETWORK;
@@ -1901,7 +2017,7 @@ azure_err_t azure_container_create(azure_client_t *client,
 
     long http_status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
-    err->http_status = (int)http_status;
+    err->http_status = clamp_http_status(http_status);
 
     /* 201 Created or 409 ContainerAlreadyExists are both success */
     if (http_status == 201 || http_status == 409) {
@@ -1927,4 +2043,12 @@ azure_err_t azure_container_create(azure_client_t *client,
     }
 
     return err->code;
+
+/* S-H5: cleanup for SLIST_APPEND failures in azure_container_create */
+cleanup:
+    if (headers) curl_slist_free_all(headers);
+    err->code = AZURE_ERR_NOMEM;
+    snprintf(err->error_message, sizeof(err->error_message),
+             "curl_slist_append allocation failed");
+    return AZURE_ERR_NOMEM;
 }

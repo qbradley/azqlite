@@ -16,6 +16,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <limits.h>
+
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#include <stdlib.h>  /* arc4random_uniform */
+#else
+#include <sys/random.h>  /* getrandom on Linux */
+#endif
 
 /* ================================================================
  * Error code to human-readable string
@@ -180,13 +187,26 @@ int azure_compute_retry_delay(int attempt, int retry_after_secs)
     int delay_ms;
 
     if (retry_after_secs > 0) {
-        /* Azure told us how long to wait — respect it */
-        delay_ms = retry_after_secs * 1000;
+        /* Azure told us how long to wait — respect it.
+         * Check overflow: retry_after_secs * 1000 must fit in int. */
+        if (retry_after_secs > INT_MAX / 1000)
+            delay_ms = AZURE_RETRY_MAX_MS;
+        else
+            delay_ms = retry_after_secs * 1000;
     } else {
         /* Exponential backoff: base * 2^attempt */
         delay_ms = AZURE_RETRY_BASE_MS * (1 << attempt);
-        /* Add jitter: 0 to base_ms random to prevent thundering herd */
-        delay_ms += rand() % AZURE_RETRY_BASE_MS;
+        /* Add jitter: 0 to base_ms random (thread-safe) */
+#if defined(__APPLE__) || defined(__FreeBSD__)
+        delay_ms += (int)arc4random_uniform(AZURE_RETRY_BASE_MS);
+#else
+        {
+            unsigned int r;
+            if (getrandom(&r, sizeof(r), 0) == (ssize_t)sizeof(r))
+                delay_ms += (int)(r % (unsigned)AZURE_RETRY_BASE_MS);
+            /* else: no jitter — safer than using rand() */
+        }
+#endif
     }
 
     if (delay_ms > AZURE_RETRY_MAX_MS)
@@ -198,6 +218,6 @@ int azure_compute_retry_delay(int attempt, int retry_after_secs)
 void azure_retry_sleep_ms(int delay_ms)
 {
     if (delay_ms > 0) {
-        usleep((unsigned int)(delay_ms * 1000));
+        usleep((useconds_t)delay_ms * 1000U);
     }
 }
