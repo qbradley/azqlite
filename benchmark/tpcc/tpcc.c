@@ -29,6 +29,8 @@ typedef struct {
 extern txn_result_t tpcc_new_order_txn(sqlite3 *db, int w_id, int num_warehouses);
 extern txn_result_t tpcc_payment_txn(sqlite3 *db, int w_id, int num_warehouses);
 extern txn_result_t tpcc_order_status_txn(sqlite3 *db, int w_id, int num_warehouses);
+extern int  tpcc_prepare_stmts(sqlite3 *db);
+extern void tpcc_finalize_stmts(void);
 
 /* Transaction statistics */
 typedef struct {
@@ -335,6 +337,12 @@ static int run_benchmark(benchmark_config_t *config) {
   printf("\nStarting benchmark run...\n");;
   printf("=================================================================\n");
   
+  if (tpcc_prepare_stmts(db) != 0) {
+    fprintf(stderr, "Failed to prepare cached statements\n");
+    sqlite3_close(db);
+    return 1;
+  }
+
   srand(time(NULL));
   start_time = get_time_ms();
   end_time = start_time + (config->duration_seconds * 1000.0);
@@ -456,6 +464,7 @@ static int run_benchmark(benchmark_config_t *config) {
   printf("=================================================================\n");
   
   /* Cleanup */
+  tpcc_finalize_stmts();
   free(neworder_stats.latencies);
   free(payment_stats.latencies);
   free(orderstatus_stats.latencies);

@@ -26,8 +26,10 @@ CFLAGS   += -I$(SRC_DIR) -I$(SQLITE_DIR) -I.
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
     LDFLAGS  = -lpthread -lm
+    CFLAGS   += -D_DARWIN_C_SOURCE
 else
     LDFLAGS  = -lpthread -ldl -lm
+    CFLAGS   += -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
 endif
 
 # pkg-config support for production dependencies

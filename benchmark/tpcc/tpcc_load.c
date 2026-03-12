@@ -238,9 +238,18 @@ static int load_warehouse(sqlite3 *db, int w_id) {
       sqlite3_reset(stmt_hist);
     }
     
+    /* Build a permutation of customer IDs 1..3000 so every customer gets
+     * exactly one initial order (per TPC-C spec clause 4.3.3.1). */
+    int *c_perm = malloc(TPCC_CUSTOMERS_PER_DIST * sizeof(int));
+    for (int i = 0; i < TPCC_CUSTOMERS_PER_DIST; i++) c_perm[i] = i + 1;
+    for (int i = TPCC_CUSTOMERS_PER_DIST - 1; i > 0; i--) {
+      int j = rand() % (i + 1);
+      int tmp = c_perm[i]; c_perm[i] = c_perm[j]; c_perm[j] = tmp;
+    }
+
     /* Insert initial orders */
     for (int o_id = 1; o_id <= TPCC_INITIAL_ORDERS; o_id++) {
-      int c_id = rand() % TPCC_CUSTOMERS_PER_DIST + 1;
+      int c_id = c_perm[o_id - 1];
       int ol_cnt = rand() % 11 + 5; /* 5-15 order lines */
       
       sqlite3_bind_int(stmt_ord, 1, o_id);
@@ -286,6 +295,7 @@ static int load_warehouse(sqlite3 *db, int w_id) {
         sqlite3_reset(stmt_ol);
       }
     }
+    free(c_perm);
   }
   
   sqlite3_finalize(stmt_dist);
