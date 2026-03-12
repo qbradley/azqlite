@@ -217,6 +217,7 @@ static void dirtyMarkPage(azqliteFile *p, sqlite3_int64 offset) {
     int pageIdx = (int)(offset / p->pageSize);
     int byteIdx = pageIdx / 8;
     int bitIdx = pageIdx % 8;
+    if (byteIdx < 0 || byteIdx >= p->nDirtyAlloc) return;
     if (!(p->aDirty[byteIdx] & (1 << bitIdx))) {
         p->aDirty[byteIdx] |= (1 << bitIdx);
         p->nDirtyPages++;
@@ -227,6 +228,7 @@ static int dirtyIsPageDirty(azqliteFile *p, int pageIdx) {
     if (!p->aDirty) return 0;
     int byteIdx = pageIdx / 8;
     int bitIdx = pageIdx % 8;
+    if (byteIdx < 0 || byteIdx >= p->nDirtyAlloc) return 0;
     return (p->aDirty[byteIdx] & (1 << bitIdx)) != 0;
 }
 
@@ -427,7 +429,7 @@ static int azqliteClose(sqlite3_file *pFile) {
     p->aJrnlData = NULL;
     free(p->aWalData);
     p->aWalData = NULL;
-    free(p->zBlobName);
+    sqlite3_free(p->zBlobName);
     p->zBlobName = NULL;
 
     p->pMethod = NULL;
@@ -457,6 +459,11 @@ static int azqliteRead(sqlite3_file *pFile, void *pBuf, int iAmt,
         src = p->aData;
         srcLen = p->nData;
         g_xread_count++;
+    }
+
+    if (!src) {
+        memset(pBuf, 0, iAmt);
+        return SQLITE_IOERR_SHORT_READ;
     }
 
     if (iOfst >= srcLen) {
@@ -582,9 +589,9 @@ static int azqliteTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
     if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
         if (size < p->nJrnlData) {
             p->nJrnlData = size;
-            if (p->aJrnlData && size > 0) {
+            if (p->aJrnlData && size < p->nJrnlAlloc) {
                 memset(p->aJrnlData + size, 0,
-                       (size_t)(p->nJrnlAlloc - size < 0 ? 0 : p->nJrnlAlloc - size));
+                       (size_t)(p->nJrnlAlloc - size));
             }
         }
         return SQLITE_OK;
@@ -731,6 +738,20 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
                         NULL, &aerr);
                     azure_error_clear(&aerr);
                     if (arc != AZURE_OK) {
+                        /* Partial append — delete and recreate blob so next
+                        ** sync re-uploads everything cleanly */
+                        if (p->ops->append_blob_delete) {
+                            azure_error_init(&aerr);
+                            p->ops->append_blob_delete(
+                                p->ops_ctx, p->zBlobName, NULL, &aerr);
+                        }
+                        if (p->ops->append_blob_create) {
+                            azure_error_init(&aerr);
+                            p->ops->append_blob_create(
+                                p->ops_ctx, p->zBlobName, NULL, &aerr);
+                        }
+                        p->nWalSynced = 0;
+                        p->walNeedFullResync = 1;
                         return SQLITE_IOERR_FSYNC;
                     }
                     off += chunk;
@@ -754,6 +775,20 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
                         NULL, &aerr);
                     azure_error_clear(&aerr);
                     if (arc != AZURE_OK) {
+                        /* Partial append — delete and recreate blob so next
+                        ** sync re-uploads everything cleanly */
+                        if (p->ops->append_blob_delete) {
+                            azure_error_init(&aerr);
+                            p->ops->append_blob_delete(
+                                p->ops_ctx, p->zBlobName, NULL, &aerr);
+                        }
+                        if (p->ops->append_blob_create) {
+                            azure_error_init(&aerr);
+                            p->ops->append_blob_create(
+                                p->ops_ctx, p->zBlobName, NULL, &aerr);
+                        }
+                        p->nWalSynced = 0;
+                        p->walNeedFullResync = 1;
                         return SQLITE_IOERR_FSYNC;
                     }
                     off += chunk;
@@ -1111,6 +1146,9 @@ static int azqliteFileControl(sqlite3_file *pFile, int op, void *pArg) {
                     }
                     /* Append blob ops available — let SQLite set WAL mode.
                     ** Requires: PRAGMA locking_mode=EXCLUSIVE set first. */
+                    fprintf(stderr,
+                        "azqlite: WARNING — journal_mode=WAL requires "
+                        "PRAGMA locking_mode=EXCLUSIVE for azqlite.\n");
                     return SQLITE_NOTFOUND;
                 }
             }
@@ -1170,6 +1208,9 @@ static int azqliteShmMap(sqlite3_file *pFile, int iRegion, int szRegion,
     *pp = NULL;
     /* Never called in exclusive mode. Return SQLITE_IOERR to fail safely
     ** if the user forgot PRAGMA locking_mode=EXCLUSIVE. */
+    fprintf(stderr,
+        "azqlite: ERROR — xShmMap called, but azqlite WAL requires "
+        "PRAGMA locking_mode=EXCLUSIVE. Shared-memory WAL is not supported.\n");
     return SQLITE_IOERR;
 }
 
@@ -1229,8 +1270,9 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     p->ops = pVfsData->ops;
     p->ops_ctx = pVfsData->ops_ctx;
     p->pVfsData = pVfsData;             /* R1: back-pointer for cache access */
-    p->eFileType = flags & 0x0000FF00;  /* Extract type flags */
-    if (isWal) p->eFileType = SQLITE_OPEN_WAL;  /* WAL flag outside 0xFF00 mask */
+    if (isWal) p->eFileType = SQLITE_OPEN_WAL;
+    else if (isMainJournal) p->eFileType = SQLITE_OPEN_MAIN_JOURNAL;
+    else p->eFileType = SQLITE_OPEN_MAIN_DB;
     p->eLock = SQLITE_LOCK_NONE;
     p->leaseId[0] = '\0';
     p->leaseDuration = AZQLITE_LEASE_DURATION;
@@ -1248,7 +1290,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             azure_err_t arc = p->ops->blob_exists(p->ops_ctx, zName,
                                                     &blobExists, &aerr);
             if (arc != AZURE_OK && arc != AZURE_ERR_NOT_FOUND) {
-                free(p->zBlobName);
+                sqlite3_free(p->zBlobName);
                 p->zBlobName = NULL;
                 return azureErrToSqlite(arc, SQLITE_CANTOPEN);
             }
@@ -1262,7 +1304,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             azure_err_t arc = p->ops->blob_get_properties(
                 p->ops_ctx, zName, &blobSize, NULL, NULL, &aerr);
             if (arc != AZURE_OK) {
-                free(p->zBlobName);
+                sqlite3_free(p->zBlobName);
                 p->zBlobName = NULL;
                 return azureErrToSqlite(arc, SQLITE_CANTOPEN);
             }
@@ -1274,7 +1316,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             if (blobSize > 0) {
                 int rc = bufferEnsure(p, blobSize);
                 if (rc != SQLITE_OK) {
-                    free(p->zBlobName);
+                    sqlite3_free(p->zBlobName);
                     p->zBlobName = NULL;
                     return rc;
                 }
@@ -1289,7 +1331,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                     p->aData = NULL;
                     free(p->aDirty);
                     p->aDirty = NULL;
-                    free(p->zBlobName);
+                    sqlite3_free(p->zBlobName);
                     p->zBlobName = NULL;
                     return azureErrToSqlite(arc, SQLITE_CANTOPEN);
                 }
@@ -1323,7 +1365,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 azure_err_t arc = p->ops->page_blob_create(
                     p->ops_ctx, zName, 0, &aerr);
                 if (arc != AZURE_OK) {
-                    free(p->zBlobName);
+                    sqlite3_free(p->zBlobName);
                     p->zBlobName = NULL;
                     return azureErrToSqlite(arc, SQLITE_CANTOPEN);
                 }
@@ -1332,12 +1374,12 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             /* Allocate initial buffer */
             int rc = bufferEnsure(p, AZQLITE_INITIAL_ALLOC);
             if (rc != SQLITE_OK) {
-                free(p->zBlobName);
+                sqlite3_free(p->zBlobName);
                 p->zBlobName = NULL;
                 return rc;
             }
         } else if (!blobExists) {
-            free(p->zBlobName);
+            sqlite3_free(p->zBlobName);
             p->zBlobName = NULL;
             return SQLITE_CANTOPEN;
         }
@@ -1384,7 +1426,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 }
                 free(buf.data);
                 if (rc != SQLITE_OK) {
-                    free(p->zBlobName);
+                    sqlite3_free(p->zBlobName);
                     p->zBlobName = NULL;
                     return rc;
                 }
@@ -1399,7 +1441,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
         /* Verify append blob operations are available */
         if (!p->ops || !p->ops->append_blob_create ||
             !p->ops->append_blob_append || !p->ops->append_blob_delete) {
-            free(p->zBlobName);
+            sqlite3_free(p->zBlobName);
             p->zBlobName = NULL;
             return SQLITE_CANTOPEN;
         }
@@ -1412,7 +1454,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             azure_err_t arc = p->ops->blob_exists(p->ops_ctx, zName,
                                                     &walExists, &aerr);
             if (arc != AZURE_OK && arc != AZURE_ERR_NOT_FOUND) {
-                free(p->zBlobName);
+                sqlite3_free(p->zBlobName);
                 p->zBlobName = NULL;
                 return azureErrToSqlite(arc, SQLITE_CANTOPEN);
             }
@@ -1437,7 +1479,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 if (rc != SQLITE_OK) {
                     free(p->aWalData);
                     p->aWalData = NULL;
-                    free(p->zBlobName);
+                    sqlite3_free(p->zBlobName);
                     p->zBlobName = NULL;
                     return rc;
                 }
@@ -1446,7 +1488,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 ** do NOT proceed without WAL replay or committed
                 ** transactions will be silently lost. */
                 free(buf.data);
-                free(p->zBlobName);
+                sqlite3_free(p->zBlobName);
                 p->zBlobName = NULL;
                 return azureErrToSqlite(arc, SQLITE_CANTOPEN);
             } else {
@@ -1460,7 +1502,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             azure_err_t arc = p->ops->append_blob_create(
                 p->ops_ctx, zName, NULL, &aerr);
             if (arc != AZURE_OK) {
-                free(p->zBlobName);
+                sqlite3_free(p->zBlobName);
                 p->zBlobName = NULL;
                 return azureErrToSqlite(arc, SQLITE_CANTOPEN);
             }
@@ -1478,12 +1520,31 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
 }
 
 /*
+** Helper: determine if a path should be routed to Azure.
+** Azure blob names are relative (no leading '/').
+** Absolute paths (starting with '/') are local filesystem paths
+** (temp files, sub-journals, etc.) and should go to the default VFS.
+*/
+static int azqliteIsAzurePath(const char *zPath) {
+    if (!zPath || zPath[0] == '\0') return 0;
+    /* Absolute filesystem paths go to the default VFS */
+    if (zPath[0] == '/') return 0;
+    /* Relative paths are Azure blob names */
+    return 1;
+}
+
+/*
 ** xDelete — Delete a blob from Azure (or delegate for temp files).
 */
 static int azqliteDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
     azqliteVfsData *pVfsData = (azqliteVfsData *)pVfs->pAppData;
 
     if (!zName) return SQLITE_OK;
+
+    /* Delegate non-Azure paths (absolute filesystem paths) to default VFS */
+    if (!azqliteIsAzurePath(zName)) {
+        return pVfsData->pDefaultVfs->xDelete(pVfsData->pDefaultVfs, zName, syncDir);
+    }
 
     if (pVfsData->ops && pVfsData->ops->blob_delete) {
         azure_error_t aerr;
@@ -1525,6 +1586,12 @@ static int azqliteDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
 static int azqliteAccess(sqlite3_vfs *pVfs, const char *zName,
                           int flags, int *pResOut) {
     azqliteVfsData *pVfsData = (azqliteVfsData *)pVfs->pAppData;
+
+    /* Delegate non-Azure paths (absolute filesystem paths) to default VFS */
+    if (!azqliteIsAzurePath(zName)) {
+        return pVfsData->pDefaultVfs->xAccess(pVfsData->pDefaultVfs, zName,
+                                               flags, pResOut);
+    }
 
     if (pVfsData->ops && pVfsData->ops->blob_exists) {
         /* R1: Use cached journal existence when available */
