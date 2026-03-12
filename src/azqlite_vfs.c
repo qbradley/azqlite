@@ -96,6 +96,184 @@ static int azqliteShmUnmap(sqlite3_file*, int);
 #define AZQLITE_MAX_PATHNAME       512
 #define AZQLITE_INITIAL_ALLOC      (64*1024)  /* 64 KiB initial buffer */
 
+/* ===================================================================
+** Demand-paging LRU page cache
+** =================================================================== */
+
+#define AZQLITE_DEFAULT_CACHE_PAGES 1024
+
+/* Page cache entry — one per cached page */
+typedef struct azqlite_cache_entry {
+    int pageNo;                          /* 0-based page index */
+    unsigned char *data;                 /* Allocated page data (pageSize bytes) */
+    int dirty;                           /* 1 = needs flush to Azure */
+    struct azqlite_cache_entry *lruPrev; /* LRU: toward MRU end */
+    struct azqlite_cache_entry *lruNext; /* LRU: toward LRU end */
+    struct azqlite_cache_entry *hashNext;/* Hash chain for hash table */
+} azqlite_cache_entry_t;
+
+/* LRU page cache with hash table lookup */
+typedef struct azqlite_page_cache {
+    int maxPages;                        /* Soft limit for clean page eviction */
+    int nPages;                          /* Current total pages in cache */
+    int nDirty;                          /* Current dirty page count */
+    int pageSize;                        /* Bytes per page (from header or default) */
+    int hashSize;                        /* Hash table bucket count (power of 2) */
+    azqlite_cache_entry_t **hashTable;   /* Hash buckets array */
+    azqlite_cache_entry_t *lruHead;      /* Most recently used */
+    azqlite_cache_entry_t *lruTail;      /* Least recently used */
+} azqlite_page_cache_t;
+
+static int cacheGetMaxPages(void) {
+    const char *val = getenv("AZQLITE_CACHE_PAGES");
+    if (val) {
+        int n = atoi(val);
+        if (n > 0) return n;
+    }
+    return AZQLITE_DEFAULT_CACHE_PAGES;
+}
+
+/* Round up to next power of 2 */
+static int cacheNextPow2(int v) {
+    if (v <= 1) return 1;
+    v--;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    return v + 1;
+}
+
+static int cacheInit(azqlite_page_cache_t *cache, int pageSize, int maxPages) {
+    memset(cache, 0, sizeof(*cache));
+    cache->pageSize = pageSize;
+    cache->maxPages = maxPages;
+    cache->hashSize = cacheNextPow2(maxPages);
+    cache->hashTable = (azqlite_cache_entry_t **)calloc(
+        (size_t)cache->hashSize, sizeof(azqlite_cache_entry_t *));
+    if (!cache->hashTable) return SQLITE_NOMEM;
+    return SQLITE_OK;
+}
+
+static void cacheLruRemove(azqlite_page_cache_t *cache,
+                           azqlite_cache_entry_t *e) {
+    if (e->lruPrev) e->lruPrev->lruNext = e->lruNext;
+    else            cache->lruHead = e->lruNext;
+    if (e->lruNext) e->lruNext->lruPrev = e->lruPrev;
+    else            cache->lruTail = e->lruPrev;
+    e->lruPrev = e->lruNext = NULL;
+}
+
+static void cacheLruTouch(azqlite_page_cache_t *cache,
+                          azqlite_cache_entry_t *e) {
+    if (cache->lruHead == e) return; /* already MRU */
+    cacheLruRemove(cache, e);
+    e->lruNext = cache->lruHead;
+    e->lruPrev = NULL;
+    if (cache->lruHead) cache->lruHead->lruPrev = e;
+    cache->lruHead = e;
+    if (!cache->lruTail) cache->lruTail = e;
+}
+
+static azqlite_cache_entry_t *cacheLookup(azqlite_page_cache_t *cache,
+                                          int pageNo) {
+    int bucket = pageNo & (cache->hashSize - 1);
+    azqlite_cache_entry_t *e = cache->hashTable[bucket];
+    while (e) {
+        if (e->pageNo == pageNo) return e;
+        e = e->hashNext;
+    }
+    return NULL;
+}
+
+/* Remove entry from hash table, LRU list, and free it */
+static void cacheRemove(azqlite_page_cache_t *cache,
+                        azqlite_cache_entry_t *e) {
+    /* Remove from hash chain */
+    int bucket = e->pageNo & (cache->hashSize - 1);
+    azqlite_cache_entry_t **pp = &cache->hashTable[bucket];
+    while (*pp && *pp != e) pp = &(*pp)->hashNext;
+    if (*pp) *pp = e->hashNext;
+
+    /* Remove from LRU */
+    cacheLruRemove(cache, e);
+
+    if (e->dirty) cache->nDirty--;
+    cache->nPages--;
+    free(e->data);
+    free(e);
+}
+
+/* Insert a new page into the cache; takes ownership of data */
+static azqlite_cache_entry_t *cacheInsert(azqlite_page_cache_t *cache,
+                                          int pageNo,
+                                          unsigned char *data,
+                                          int dirty) {
+    azqlite_cache_entry_t *e = (azqlite_cache_entry_t *)calloc(
+        1, sizeof(azqlite_cache_entry_t));
+    if (!e) return NULL;
+    e->pageNo = pageNo;
+    e->data = data;
+    e->dirty = dirty;
+
+    /* Insert into hash table */
+    int bucket = pageNo & (cache->hashSize - 1);
+    e->hashNext = cache->hashTable[bucket];
+    cache->hashTable[bucket] = e;
+
+    /* Insert at MRU end of LRU list */
+    e->lruNext = cache->lruHead;
+    e->lruPrev = NULL;
+    if (cache->lruHead) cache->lruHead->lruPrev = e;
+    cache->lruHead = e;
+    if (!cache->lruTail) cache->lruTail = e;
+
+    cache->nPages++;
+    if (dirty) cache->nDirty++;
+    return e;
+}
+
+/* Evict one clean page from LRU tail. Returns SQLITE_OK or SQLITE_NOMEM. */
+static int cacheEvictClean(azqlite_page_cache_t *cache) {
+    azqlite_cache_entry_t *e = cache->lruTail;
+    while (e) {
+        if (!e->dirty) {
+            cacheRemove(cache, e);
+            return SQLITE_OK;
+        }
+        e = e->lruPrev;
+    }
+    /* No clean pages to evict — allow cache to grow beyond soft limit */
+    return SQLITE_OK;
+}
+
+/* Remove all entries with pageNo > maxPageNo (for truncate) */
+static void cacheInvalidateAbove(azqlite_page_cache_t *cache, int maxPageNo) {
+    azqlite_cache_entry_t *e = cache->lruHead;
+    while (e) {
+        azqlite_cache_entry_t *next = e->lruNext;
+        if (e->pageNo > maxPageNo) {
+            cacheRemove(cache, e);
+        }
+        e = next;
+    }
+}
+
+/* Free all entries and the hash table */
+static void cacheDestroy(azqlite_page_cache_t *cache) {
+    azqlite_cache_entry_t *e = cache->lruHead;
+    while (e) {
+        azqlite_cache_entry_t *next = e->lruNext;
+        free(e->data);
+        free(e);
+        e = next;
+    }
+    free(cache->hashTable);
+    memset(cache, 0, sizeof(*cache));
+}
+
+
 /* ---------- Types ---------- */
 
 /* Forward declaration for back-pointer in azqliteFile */
@@ -114,16 +292,9 @@ typedef struct azqliteFile {
     void *ops_ctx;                      /* Context for ops */
     char *zBlobName;                    /* Blob name in container */
 
-    /* In-memory buffer (cache + write buffer) for MAIN_DB */
-    unsigned char *aData;               /* Full blob content */
-    sqlite3_int64 nData;                /* Current logical size */
-    sqlite3_int64 nAlloc;               /* Allocated buffer size */
-
-    /* Dirty page tracking */
-    unsigned char *aDirty;              /* Bitmap: 1 bit per page, 1=dirty */
-    int nDirtyPages;                    /* Count of dirty pages */
-    int nDirtyAlloc;                    /* Allocated size of aDirty bitmap */
-    int pageSize;                       /* Detected from header or default 4096 */
+    /* Demand-paging LRU cache for MAIN_DB */
+    azqlite_page_cache_t cache;         /* LRU page cache */
+    sqlite3_int64 blobSize;             /* Current logical blob size */
     int lastSyncDirtyCount;             /* Dirty pages at last xSync (lease heuristic) */
 
     /* Lock state */
@@ -245,87 +416,6 @@ static const sqlite3_io_methods azqliteIoMethods = {
     0, 0
 };
 
-
-/* ===================================================================
-** Helper: dirty bitmap operations
-** =================================================================== */
-
-static int dirtyBitmapSize(sqlite3_int64 fileSize, int pageSize) {
-    if (fileSize <= 0 || pageSize <= 0) return 0;
-    int nPages = (int)((fileSize + pageSize - 1) / pageSize);
-    return (nPages + 7) / 8;  /* bytes needed for bitmap */
-}
-
-static void dirtyMarkPage(azqliteFile *p, sqlite3_int64 offset) {
-    if (!p->aDirty || p->pageSize <= 0) return;
-    int pageIdx = (int)(offset / p->pageSize);
-    int byteIdx = pageIdx / 8;
-    int bitIdx = pageIdx % 8;
-    if (byteIdx < 0 || byteIdx >= p->nDirtyAlloc) return;
-    if (!(p->aDirty[byteIdx] & (1 << bitIdx))) {
-        p->aDirty[byteIdx] |= (1 << bitIdx);
-        p->nDirtyPages++;
-    }
-}
-
-static int dirtyIsPageDirty(azqliteFile *p, int pageIdx) {
-    if (!p->aDirty) return 0;
-    int byteIdx = pageIdx / 8;
-    int bitIdx = pageIdx % 8;
-    if (byteIdx < 0 || byteIdx >= p->nDirtyAlloc) return 0;
-    return (p->aDirty[byteIdx] & (1 << bitIdx)) != 0;
-}
-
-static void dirtyClearAll(azqliteFile *p) {
-    if (p->aDirty) {
-        int nBytes = dirtyBitmapSize(p->nAlloc, p->pageSize);
-        memset(p->aDirty, 0, nBytes);
-    }
-    p->nDirtyPages = 0;
-}
-
-/*
-** Ensure the dirty bitmap is large enough for the current allocation.
-** Returns SQLITE_OK or SQLITE_NOMEM.
-*/
-static int dirtyEnsureCapacity(azqliteFile *p) {
-    int needed = dirtyBitmapSize(p->nAlloc, p->pageSize);
-    if (needed <= 0) return SQLITE_OK;
-    if (needed <= p->nDirtyAlloc) return SQLITE_OK;
-    unsigned char *pNew = (unsigned char *)realloc(p->aDirty, needed);
-    if (!pNew) return SQLITE_NOMEM;
-    /* Zero new bytes (realloc doesn't guarantee zeroed memory) */
-    memset(pNew + p->nDirtyAlloc, 0, needed - p->nDirtyAlloc);
-    p->aDirty = pNew;
-    p->nDirtyAlloc = needed;
-    return SQLITE_OK;
-}
-
-
-/* ===================================================================
-** Helper: buffer management
-** =================================================================== */
-
-/*
-** Ensure aData has room for at least newSize bytes.
-** Grows geometrically.  Returns SQLITE_OK or SQLITE_NOMEM.
-*/
-static int bufferEnsure(azqliteFile *p, sqlite3_int64 newSize) {
-    if (newSize <= p->nAlloc) return SQLITE_OK;
-    sqlite3_int64 alloc = p->nAlloc;
-    if (alloc == 0) alloc = AZQLITE_INITIAL_ALLOC;
-    while (alloc < newSize) {
-        alloc *= 2;
-        if (alloc < 0) return SQLITE_NOMEM; /* overflow */
-    }
-    unsigned char *pNew = (unsigned char *)realloc(p->aData, (size_t)alloc);
-    if (!pNew) return SQLITE_NOMEM;
-    /* Zero the new region */
-    memset(pNew + p->nAlloc, 0, (size_t)(alloc - p->nAlloc));
-    p->aData = pNew;
-    p->nAlloc = alloc;
-    return dirtyEnsureCapacity(p);
-}
 
 /*
 ** Ensure journal buffer has room for at least newSize bytes.
@@ -480,7 +570,7 @@ static int azqliteClose(sqlite3_file *pFile) {
     int rc = SQLITE_OK;
 
     /* Flush any remaining dirty data before closing */
-    if (p->nDirtyPages > 0 && p->ops && p->ops->page_blob_write) {
+    if (p->cache.nDirty > 0 && p->ops && p->ops->page_blob_write) {
         rc = azqliteSync(pFile, 0);
     } else if (p->eFileType == SQLITE_OPEN_WAL &&
                p->nWalData > p->nWalSynced && p->ops) {
@@ -502,10 +592,7 @@ static int azqliteClose(sqlite3_file *pFile) {
         p->leaseId[0] = '\0';
     }
 
-    free(p->aData);
-    p->aData = NULL;
-    free(p->aDirty);
-    p->aDirty = NULL;
+    cacheDestroy(&p->cache);
     free(p->aJrnlData);
     p->aJrnlData = NULL;
     free(p->aWalData);
@@ -524,51 +611,139 @@ static int azqliteClose(sqlite3_file *pFile) {
 }
 
 /*
-** xRead — Read from the in-memory buffer.
-** For MAIN_DB: read from aData.
+** xRead — Read from the page cache (MAIN_DB) or in-memory buffer.
+** For MAIN_DB: demand-page through LRU cache with range GETs on miss.
 ** For MAIN_JOURNAL: read from aJrnlData.
 ** Must zero-fill on short read (SQLITE_IOERR_SHORT_READ).
 */
 static int azqliteRead(sqlite3_file *pFile, void *pBuf, int iAmt,
                         sqlite3_int64 iOfst) {
     azqliteFile *p = (azqliteFile *)pFile;
-    unsigned char *src;
-    sqlite3_int64 srcLen;
 
+    /* WAL and journal use existing buffer paths */
     if (p->eFileType == SQLITE_OPEN_WAL) {
-        src = p->aWalData;
-        srcLen = p->nWalData;
-    } else if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
-        src = p->aJrnlData;
-        srcLen = p->nJrnlData;
+        unsigned char *src = p->aWalData;
+        sqlite3_int64 srcLen = p->nWalData;
+        if (!src || iOfst >= srcLen) {
+            memset(pBuf, 0, iAmt);
+            return SQLITE_IOERR_SHORT_READ;
+        }
+        sqlite3_int64 avail = srcLen - iOfst;
+        if (avail >= iAmt) {
+            memcpy(pBuf, src + iOfst, iAmt);
+            return SQLITE_OK;
+        }
+        memcpy(pBuf, src + iOfst, (size_t)avail);
+        memset((unsigned char *)pBuf + avail, 0, iAmt - (size_t)avail);
+        return SQLITE_IOERR_SHORT_READ;
+    }
+    if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
+        unsigned char *src = p->aJrnlData;
+        sqlite3_int64 srcLen = p->nJrnlData;
         g_xread_journal_count++;
-    } else {
-        src = p->aData;
-        srcLen = p->nData;
-        g_xread_count++;
-    }
-
-    if (!src) {
-        memset(pBuf, 0, iAmt);
+        if (!src || iOfst >= srcLen) {
+            memset(pBuf, 0, iAmt);
+            return SQLITE_IOERR_SHORT_READ;
+        }
+        sqlite3_int64 avail = srcLen - iOfst;
+        if (avail >= iAmt) {
+            memcpy(pBuf, src + iOfst, iAmt);
+            return SQLITE_OK;
+        }
+        memcpy(pBuf, src + iOfst, (size_t)avail);
+        memset((unsigned char *)pBuf + avail, 0, iAmt - (size_t)avail);
         return SQLITE_IOERR_SHORT_READ;
     }
 
-    if (iOfst >= srcLen) {
-        /* Reading entirely past end — zero fill */
-        memset(pBuf, 0, iAmt);
-        return SQLITE_IOERR_SHORT_READ;
+    /* MAIN_DB: demand-page through cache */
+    g_xread_count++;
+    int pageSize = p->cache.pageSize;
+    unsigned char *out = (unsigned char *)pBuf;
+    sqlite3_int64 remaining = iAmt;
+    sqlite3_int64 offset = iOfst;
+
+    while (remaining > 0) {
+        int pageNo = (int)(offset / pageSize);
+        int pageOff = (int)(offset % pageSize);
+        int copyLen = pageSize - pageOff;
+        if (copyLen > remaining) copyLen = (int)remaining;
+
+        /* Past logical end of file — short read */
+        if (offset >= p->blobSize) {
+            memset(out, 0, (size_t)remaining);
+            return SQLITE_IOERR_SHORT_READ;
+        }
+
+        azqlite_cache_entry_t *entry = cacheLookup(&p->cache, pageNo);
+        if (entry) {
+            cacheLruTouch(&p->cache, entry);
+        } else {
+            /* Cache miss — fetch from Azure */
+            int64_t fetchOff = (int64_t)pageNo * pageSize;
+            size_t fetchLen = (size_t)pageSize;
+            /* Clamp to blob size */
+            if (fetchOff + (int64_t)fetchLen > p->blobSize) {
+                fetchLen = (size_t)(p->blobSize - fetchOff);
+            }
+
+            unsigned char *pageData = (unsigned char *)calloc(1, (size_t)pageSize);
+            if (!pageData) return SQLITE_NOMEM;
+
+            if (fetchLen > 0) {
+                azure_buffer_t buf = {0};
+                azure_error_t aerr;
+                azure_error_init(&aerr);
+                azure_err_t aec = p->ops->page_blob_read(
+                    p->ops_ctx, p->zBlobName, fetchOff, fetchLen, &buf, &aerr);
+                if (aec != AZURE_OK) {
+                    free(pageData);
+                    int sqlRc = azureErrToSqlite(aec, SQLITE_IOERR_READ);
+                    fprintf(stderr, "azqlite: page_blob_read failed at offset %lld len %zu: %s\n",
+                            (long long)fetchOff, fetchLen, aerr.error_message);
+                    azure_error_clear(&aerr);
+                    return sqlRc;
+                }
+                if (buf.data && buf.size > 0) {
+                    size_t toCopy = buf.size < (size_t)pageSize ? buf.size : (size_t)pageSize;
+                    memcpy(pageData, buf.data, toCopy);
+                }
+                free(buf.data);
+            }
+
+            /* Evict if at capacity */
+            if (p->cache.nPages >= p->cache.maxPages) {
+                cacheEvictClean(&p->cache);
+            }
+            entry = cacheInsert(&p->cache, pageNo, pageData, 0);
+            if (!entry) {
+                free(pageData);
+                return SQLITE_NOMEM;
+            }
+        }
+
+        /* Handle short read within partial page at end of file */
+        sqlite3_int64 endOfPage = (sqlite3_int64)(pageNo + 1) * pageSize;
+        if (endOfPage > p->blobSize) {
+            int validInPage = (int)(p->blobSize - (sqlite3_int64)pageNo * pageSize);
+            if (pageOff >= validInPage) {
+                memset(out, 0, (size_t)remaining);
+                return SQLITE_IOERR_SHORT_READ;
+            }
+            if (pageOff + copyLen > validInPage) {
+                int validCopy = validInPage - pageOff;
+                memcpy(out, entry->data + pageOff, validCopy);
+                memset(out + validCopy, 0, (size_t)(remaining - validCopy));
+                return SQLITE_IOERR_SHORT_READ;
+            }
+        }
+
+        memcpy(out, entry->data + pageOff, copyLen);
+        out += copyLen;
+        offset += copyLen;
+        remaining -= copyLen;
     }
 
-    sqlite3_int64 avail = srcLen - iOfst;
-    if (avail >= iAmt) {
-        memcpy(pBuf, src + iOfst, iAmt);
-        return SQLITE_OK;
-    }
-
-    /* Short read — copy what we have, zero the rest */
-    memcpy(pBuf, src + iOfst, (size_t)avail);
-    memset((unsigned char *)pBuf + avail, 0, iAmt - (size_t)avail);
-    return SQLITE_IOERR_SHORT_READ;
+    return SQLITE_OK;
 }
 
 /*
@@ -605,13 +780,11 @@ static int azqliteWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
         return SQLITE_OK;
     }
 
-    /* MAIN_DB — write to aData + mark dirty */
-    sqlite3_int64 end = iOfst + iAmt;
-    rc = bufferEnsure(p, end);
-    if (rc != SQLITE_OK) return rc;
-
-    memcpy(p->aData + iOfst, pBuf, iAmt);
-    if (end > p->nData) p->nData = end;
+    /* MAIN_DB — write through page cache */
+    int pageSize = p->cache.pageSize;
+    const unsigned char *src = (const unsigned char *)pBuf;
+    sqlite3_int64 remaining = iAmt;
+    sqlite3_int64 offset = iOfst;
 
     /* Renew lease if needed during long write sequences */
     if (hasLease(p)) {
@@ -619,13 +792,73 @@ static int azqliteWrite(sqlite3_file *pFile, const void *pBuf, int iAmt,
         if (rc != SQLITE_OK) return rc;
     }
 
-    /* Mark affected pages dirty */
-    if (p->pageSize > 0) {
-        sqlite3_int64 pageStart = (iOfst / p->pageSize) * p->pageSize;
-        while (pageStart < end) {
-            dirtyMarkPage(p, pageStart);
-            pageStart += p->pageSize;
+    while (remaining > 0) {
+        int pageNo = (int)(offset / pageSize);
+        int pageOff = (int)(offset % pageSize);
+        int copyLen = pageSize - pageOff;
+        if (copyLen > remaining) copyLen = (int)remaining;
+
+        azqlite_cache_entry_t *entry = cacheLookup(&p->cache, pageNo);
+        if (entry) {
+            cacheLruTouch(&p->cache, entry);
+        } else {
+            /* Need a new page in cache */
+            unsigned char *pageData = (unsigned char *)calloc(1, (size_t)pageSize);
+            if (!pageData) return SQLITE_NOMEM;
+
+            int isFullPage = (pageOff == 0 && copyLen == pageSize);
+            int64_t pageStart = (int64_t)pageNo * pageSize;
+
+            /* For partial writes, fetch existing page content from Azure first */
+            if (!isFullPage && pageStart < p->blobSize) {
+                size_t fetchLen = (size_t)pageSize;
+                if (pageStart + (int64_t)fetchLen > p->blobSize) {
+                    fetchLen = (size_t)(p->blobSize - pageStart);
+                }
+                azure_buffer_t buf = {0};
+                azure_error_t aerr;
+                azure_error_init(&aerr);
+                azure_err_t aec = p->ops->page_blob_read(
+                    p->ops_ctx, p->zBlobName, pageStart, fetchLen, &buf, &aerr);
+                if (aec != AZURE_OK) {
+                    free(pageData);
+                    int sqlRc = azureErrToSqlite(aec, SQLITE_IOERR_READ);
+                    fprintf(stderr, "azqlite: page_blob_read failed at offset %lld: %s\n",
+                            (long long)pageStart, aerr.error_message);
+                    azure_error_clear(&aerr);
+                    return sqlRc;
+                }
+                if (buf.data && buf.size > 0) {
+                    size_t toCopy = buf.size < (size_t)pageSize ? buf.size : (size_t)pageSize;
+                    memcpy(pageData, buf.data, toCopy);
+                }
+                free(buf.data);
+            }
+
+            if (p->cache.nPages >= p->cache.maxPages) {
+                cacheEvictClean(&p->cache);
+            }
+            entry = cacheInsert(&p->cache, pageNo, pageData, 0);
+            if (!entry) {
+                free(pageData);
+                return SQLITE_NOMEM;
+            }
         }
+
+        memcpy(entry->data + pageOff, src, copyLen);
+        if (!entry->dirty) {
+            entry->dirty = 1;
+            p->cache.nDirty++;
+        }
+
+        src += copyLen;
+        offset += copyLen;
+        remaining -= copyLen;
+    }
+
+    /* Extend logical size if write goes past current end */
+    if (iOfst + iAmt > p->blobSize) {
+        p->blobSize = iOfst + iAmt;
     }
 
     return SQLITE_OK;
@@ -701,77 +934,135 @@ static int azqliteTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
         p->lastSyncedSize = size;
     }
 
-    if (size < p->nData) {
-        p->nData = size;
+    if (size < p->blobSize) {
+        /* Invalidate cache entries beyond new size */
+        if (p->cache.pageSize > 0) {
+            int maxPageNo = (size == 0) ? -1 : (int)((size - 1) / p->cache.pageSize);
+            cacheInvalidateAbove(&p->cache, maxPageNo);
+        }
     }
+    p->blobSize = size;
     return SQLITE_OK;
 }
 
 /* Maximum bytes per Azure Put Page request (4 MiB) */
 #define AZQLITE_MAX_PUT_PAGE  (4 * 1024 * 1024)
 
-/*
-** coalesceDirtyRanges — Scan the dirty bitmap and merge contiguous dirty
-** pages into azure_page_range_t entries.  Each range is capped at 4 MiB
-** and the final range is 512-byte aligned upward.
-**
-** Returns the number of ranges written to `ranges`, or -1 if maxRanges
-** is too small to hold all the coalesced ranges.
-*/
-static int coalesceDirtyRanges(
-    azqliteFile *p,
-    azure_page_range_t *ranges,
-    int maxRanges
-){
-    if (p->nDirtyPages == 0) return 0;
-    if (!p->aDirty || p->pageSize <= 0 || p->nData <= 0) return 0;
+/* Stack-allocated range threshold (avoid heap for small flushes) */
+#define AZQLITE_STACK_RANGES 64
 
-    int nPages = (int)((p->nData + p->pageSize - 1) / p->pageSize);
+/*
+** cacheCollectDirty — Collect all dirty cache entries, sorted by pageNo.
+** Caller must free returned array.  Returns count in *pnDirty.
+*/
+static azqlite_cache_entry_t **cacheCollectDirty(azqlite_page_cache_t *cache,
+                                                  int *pnDirty) {
+    if (cache->nDirty == 0) {
+        *pnDirty = 0;
+        return NULL;
+    }
+    azqlite_cache_entry_t **arr = (azqlite_cache_entry_t **)malloc(
+        (size_t)cache->nDirty * sizeof(azqlite_cache_entry_t *));
+    if (!arr) { *pnDirty = 0; return NULL; }
+
+    int n = 0;
+    azqlite_cache_entry_t *e = cache->lruHead;
+    while (e) {
+        if (e->dirty) arr[n++] = e;
+        e = e->lruNext;
+    }
+    *pnDirty = n;
+
+    /* Insertion sort by pageNo (typically small count or nearly sorted) */
+    for (int i = 1; i < n; i++) {
+        azqlite_cache_entry_t *key = arr[i];
+        int j = i - 1;
+        while (j >= 0 && arr[j]->pageNo > key->pageNo) {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
+    return arr;
+}
+
+/*
+** cacheCoalesceRanges — Given sorted dirty entries, coalesce consecutive
+** pages into azure_page_range_t entries.  Each range is capped at 4 MiB,
+** uses a temp buffer (contiguous copy of page data), and is 512-byte aligned.
+**
+** Sets *pnRanges to the count of ranges.  Caller must free each range's
+** data pointer and the ranges array (if heap-allocated).
+** Returns SQLITE_OK or SQLITE_NOMEM.
+*/
+static int cacheCoalesceRanges(
+    azqlite_cache_entry_t **dirty, int nDirty, int pageSize,
+    sqlite3_int64 blobSize,
+    azure_page_range_t *ranges, int maxRanges, int *pnRanges
+){
     int nRanges = 0;
     int i = 0;
 
-    while (i < nPages) {
-        /* Skip clean pages */
-        if (!dirtyIsPageDirty(p, i)) { i++; continue; }
-
-        /* Start of a dirty run */
-        int64_t runStart = (int64_t)i * p->pageSize;
-        int runPages = 0;
-
-        while (i < nPages && dirtyIsPageDirty(p, i)) {
-            runPages++;
-            int64_t runBytes = (int64_t)runPages * p->pageSize;
-            if (runBytes >= AZQLITE_MAX_PUT_PAGE) break;
-            i++;
+    while (i < nDirty) {
+        int runStart = dirty[i]->pageNo;
+        int runCount = 1;
+        /* Extend run with consecutive pages, capped at 4 MiB */
+        while (i + runCount < nDirty
+               && dirty[i + runCount]->pageNo == runStart + runCount
+               && (int64_t)runCount * pageSize < AZQLITE_MAX_PUT_PAGE) {
+            runCount++;
         }
 
-        /* If we stopped because of the 4 MiB cap, advance past this page */
-        if (i < nPages && dirtyIsPageDirty(p, i)
-            && (int64_t)runPages * p->pageSize >= AZQLITE_MAX_PUT_PAGE) {
-            i++;
-        }
-
-        /* Compute range length.  Last page may be shorter than pageSize. */
-        int64_t runEnd = runStart + (int64_t)runPages * p->pageSize;
-        if (runEnd > p->nData) runEnd = p->nData;
-        size_t len = (size_t)(runEnd - runStart);
-
+        /* Compute byte range */
+        int64_t offset = (int64_t)runStart * pageSize;
+        int64_t runEnd = offset + (int64_t)runCount * pageSize;
+        if (runEnd > blobSize) runEnd = blobSize;
+        size_t len = (size_t)(runEnd - offset);
         /* 512-byte align up */
         len = (len + 511) & ~(size_t)511;
 
-        if (nRanges >= maxRanges) return -1;
+        /* Build contiguous temp buffer for this range */
+        unsigned char *buf = (unsigned char *)calloc(1, len);
+        if (!buf) {
+            /* Free previously allocated range buffers */
+            for (int r = 0; r < nRanges; r++) {
+                free((void *)ranges[r].data);
+            }
+            *pnRanges = 0;
+            return SQLITE_NOMEM;
+        }
+        for (int j = 0; j < runCount; j++) {
+            size_t copyLen = (size_t)pageSize;
+            int64_t pageEnd = offset + (int64_t)(j + 1) * pageSize;
+            if (pageEnd > blobSize) {
+                copyLen = (size_t)(blobSize - (offset + (int64_t)j * pageSize));
+            }
+            if ((int64_t)copyLen > 0) {
+                memcpy(buf + (size_t)j * (size_t)pageSize,
+                       dirty[i + j]->data, copyLen);
+            }
+        }
 
-        ranges[nRanges].offset = runStart;
-        ranges[nRanges].data = p->aData + runStart;
+        if (nRanges >= maxRanges) {
+            free(buf);
+            for (int r = 0; r < nRanges; r++) {
+                free((void *)ranges[r].data);
+            }
+            *pnRanges = 0;
+            return SQLITE_IOERR_FSYNC;
+        }
+
+        ranges[nRanges].offset = offset;
+        ranges[nRanges].data = buf;
         ranges[nRanges].len = len;
         nRanges++;
+
+        i += runCount;
     }
 
-    return nRanges;
+    *pnRanges = nRanges;
+    return SQLITE_OK;
 }
-
-/* Stack-allocated range threshold (avoid heap for small flushes) */
-#define AZQLITE_STACK_RANGES 64
 
 /*
 ** xSync — Flush dirty pages to Azure.
@@ -917,67 +1208,82 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
         return SQLITE_OK;
     }
 
-    /* MAIN_DB — flush dirty pages */
-    if (p->nDirtyPages == 0) return SQLITE_OK;
+    /* MAIN_DB — flush dirty pages from cache */
+    if (p->cache.nDirty == 0) return SQLITE_OK;
     if (!p->ops || !p->ops->page_blob_write) return SQLITE_IOERR_FSYNC;
 
     double sync_t0 = 0;
     if (azqlite_debug_timing()) sync_t0 = azqlite_time_ms();
 
     /* Record dirty page count for lease duration heuristic */
-    int dirtyCountBeforeSync = p->nDirtyPages;
+    int dirtyCountBeforeSync = p->cache.nDirty;
 
     /* Renew lease before flushing */
     int rc = leaseRenewIfNeeded(p);
     if (rc != SQLITE_OK) return SQLITE_IOERR_FSYNC;
 
-    /* R2: Only resize if the blob has actually grown since last sync.
-    ** Most TPC-C transactions modify existing pages without growing the file,
-    ** so this skips a ~45ms HTTP round-trip per transaction. */
+    /* R2: Only resize if the blob has actually grown since last sync. */
     double resize_ms = 0;
-    if (p->nData > p->lastSyncedSize && p->ops->page_blob_resize) {
-        sqlite3_int64 alignedSize = (p->nData + 511) & ~(sqlite3_int64)511;
+    if (p->blobSize > p->lastSyncedSize && p->ops->page_blob_resize) {
+        sqlite3_int64 alignedSize = (p->blobSize + 511) & ~(sqlite3_int64)511;
         double rt0 = 0;
         if (azqlite_debug_timing()) rt0 = azqlite_time_ms();
 
         azure_error_init(&aerr);
         azure_err_t arc = p->ops->page_blob_resize(p->ops_ctx, p->zBlobName,
-                                                     alignedSize,
-                                                     hasLease(p) ? p->leaseId : NULL,
-                                                     &aerr);
+                                                      alignedSize,
+                                                      hasLease(p) ? p->leaseId : NULL,
+                                                      &aerr);
         if (azqlite_debug_timing()) resize_ms = azqlite_time_ms() - rt0;
 
         if (arc != AZURE_OK) {
             return SQLITE_IOERR_FSYNC;
         }
-        p->lastSyncedSize = p->nData;
+        p->lastSyncedSize = p->blobSize;
     }
 
-    /* Coalesce dirty pages into contiguous ranges */
+    /* Collect and sort dirty entries */
     double coalesce_t0 = 0;
     if (azqlite_debug_timing()) coalesce_t0 = azqlite_time_ms();
 
+    int nDirtyEntries = 0;
+    azqlite_cache_entry_t **dirtyArr = cacheCollectDirty(&p->cache, &nDirtyEntries);
+    if (nDirtyEntries > 0 && !dirtyArr) return SQLITE_NOMEM;
+
+    /* Coalesce into ranges */
     azure_page_range_t stackRanges[AZQLITE_STACK_RANGES];
     azure_page_range_t *ranges = stackRanges;
     int maxRanges = AZQLITE_STACK_RANGES;
+    int nRanges = 0;
 
-    int nRanges = coalesceDirtyRanges(p, ranges, maxRanges);
-    if (nRanges < 0) {
-        maxRanges = p->nDirtyPages;
+    rc = cacheCoalesceRanges(dirtyArr, nDirtyEntries, p->cache.pageSize,
+                              p->blobSize, ranges, maxRanges, &nRanges);
+    if (rc != SQLITE_OK && rc != SQLITE_IOERR_FSYNC) {
+        free(dirtyArr);
+        return rc;
+    }
+    if (rc == SQLITE_IOERR_FSYNC) {
+        /* Stack too small — retry with heap */
+        maxRanges = nDirtyEntries;
         ranges = (azure_page_range_t *)sqlite3_malloc64(
             (sqlite3_int64)maxRanges * (sqlite3_int64)sizeof(azure_page_range_t));
-        if (!ranges) return SQLITE_NOMEM;
-        nRanges = coalesceDirtyRanges(p, ranges, maxRanges);
-        if (nRanges < 0) {
+        if (!ranges) {
+            free(dirtyArr);
+            return SQLITE_NOMEM;
+        }
+        rc = cacheCoalesceRanges(dirtyArr, nDirtyEntries, p->cache.pageSize,
+                                  p->blobSize, ranges, maxRanges, &nRanges);
+        if (rc != SQLITE_OK) {
             sqlite3_free(ranges);
-            return SQLITE_IOERR_FSYNC;
+            free(dirtyArr);
+            return rc;
         }
     }
 
     double coalesce_ms = 0;
     if (azqlite_debug_timing()) coalesce_ms = azqlite_time_ms() - coalesce_t0;
 
-    /* Try batch write if available (Phase 2 — will be non-NULL with curl_multi) */
+    /* Try batch write if available */
     if (p->ops->page_blob_write_batch) {
         double wt0 = 0;
         if (azqlite_debug_timing()) wt0 = azqlite_time_ms();
@@ -1003,13 +1309,20 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
             g_xread_journal_count = 0;
         }
 
+        for (int i = 0; i < nRanges; i++) free((void *)ranges[i].data);
         if (ranges != stackRanges) sqlite3_free(ranges);
+        free(dirtyArr);
+
         if (arc != AZURE_OK) return SQLITE_IOERR_FSYNC;
         p->lastSyncDirtyCount = dirtyCountBeforeSync;
         if (aerr.etag[0] != '\0') {
             memcpy(p->etag, aerr.etag, sizeof(p->etag));
         }
-        dirtyClearAll(p);
+        /* Clear dirty flags on cache entries */
+        for (azqlite_cache_entry_t *e = p->cache.lruHead; e; e = e->lruNext) {
+            e->dirty = 0;
+        }
+        p->cache.nDirty = 0;
         return SQLITE_OK;
     }
 
@@ -1022,7 +1335,9 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
         if (hasLease(p) && i > 0 && (i % 50 == 0)) {
             rc = leaseRenewIfNeeded(p);
             if (rc != SQLITE_OK) {
+                for (int j = i; j < nRanges; j++) free((void *)ranges[j].data);
                 if (ranges != stackRanges) sqlite3_free(ranges);
+                free(dirtyArr);
                 return SQLITE_IOERR_FSYNC;
             }
         }
@@ -1033,11 +1348,16 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
             ranges[i].offset, ranges[i].data, ranges[i].len,
             hasLease(p) ? p->leaseId : NULL, &aerr);
 
+        free((void *)ranges[i].data);
+
         if (arc != AZURE_OK) {
+            for (int j = i + 1; j < nRanges; j++) free((void *)ranges[j].data);
             if (ranges != stackRanges) sqlite3_free(ranges);
+            free(dirtyArr);
             return SQLITE_IOERR_FSYNC;
         }
-    } {
+    }
+    if (azqlite_debug_timing()) {
         double write_ms = azqlite_time_ms() - write_t0;
         double total_ms = azqlite_time_ms() - sync_t0;
         size_t total_bytes = 0;
@@ -1059,7 +1379,13 @@ static int azqliteSync(sqlite3_file *pFile, int flags) {
     }
 
     if (ranges != stackRanges) sqlite3_free(ranges);
-    dirtyClearAll(p);
+    free(dirtyArr);
+
+    /* Clear dirty flags on cache entries */
+    for (azqlite_cache_entry_t *e = p->cache.lruHead; e; e = e->lruNext) {
+        e->dirty = 0;
+    }
+    p->cache.nDirty = 0;
     return SQLITE_OK;
 }
 
@@ -1073,7 +1399,7 @@ static int azqliteFileSize(sqlite3_file *pFile, sqlite3_int64 *pSize) {
     } else if (p->eFileType & SQLITE_OPEN_MAIN_JOURNAL) {
         *pSize = p->nJrnlData;
     } else {
-        *pSize = p->nData;
+        *pSize = p->blobSize;
     }
     return SQLITE_OK;
 }
@@ -1406,17 +1732,38 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     p->leaseDuration = AZQLITE_LEASE_DURATION;
     p->lastSyncDirtyCount = 0;
     p->etag[0] = '\0';
-    p->pageSize = AZQLITE_DEFAULT_PAGE_SIZE;
 
     if (isMainDb) {
-        /* MAIN_DB → Azure page blob */
+        /* MAIN_DB: Initialize page cache and fetch first page for header.
+        ** Use blob_get_properties as single HEAD request — returns NOT_FOUND
+        ** if blob doesn't exist, eliminating the separate blob_exists call. */
         int blobExists = 0;
+        int64_t blobSize = 0;
 
-        if (p->ops && p->ops->blob_exists) {
+        if (p->ops && p->ops->blob_get_properties) {
+            azure_error_t aerr;
+            azure_error_init(&aerr);
+            azure_err_t arc = p->ops->blob_get_properties(
+                p->ops_ctx, zName, &blobSize, NULL, NULL, &aerr);
+            if (arc == AZURE_OK) {
+                blobExists = 1;
+                /* Capture initial ETag from blob properties */
+                if (aerr.etag[0] != '\0') {
+                    memcpy(p->etag, aerr.etag, sizeof(p->etag));
+                }
+            } else if (arc == AZURE_ERR_NOT_FOUND) {
+                blobExists = 0;
+            } else {
+                sqlite3_free(p->zBlobName);
+                p->zBlobName = NULL;
+                return azureErrToSqlite(arc, SQLITE_CANTOPEN);
+            }
+        } else if (p->ops && p->ops->blob_exists) {
+            /* Fallback if blob_get_properties not available */
             azure_error_t aerr;
             azure_error_init(&aerr);
             azure_err_t arc = p->ops->blob_exists(p->ops_ctx, zName,
-                                                    &blobExists, &aerr);
+                                                     &blobExists, &aerr);
             if (arc != AZURE_OK && arc != AZURE_ERR_NOT_FOUND) {
                 sqlite3_free(p->zBlobName);
                 p->zBlobName = NULL;
@@ -1424,66 +1771,73 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             }
         }
 
-        if (blobExists && p->ops && p->ops->blob_get_properties) {
-            /* Download existing blob */
-            int64_t blobSize = 0;
-            azure_error_t aerr;
-            azure_error_init(&aerr);
-            azure_err_t arc = p->ops->blob_get_properties(
-                p->ops_ctx, zName, &blobSize, NULL, NULL, &aerr);
-            if (arc != AZURE_OK) {
-                sqlite3_free(p->zBlobName);
-                p->zBlobName = NULL;
-                return azureErrToSqlite(arc, SQLITE_CANTOPEN);
-            }
-            /* Capture initial ETag from blob properties */
-            if (aerr.etag[0] != '\0') {
-                memcpy(p->etag, aerr.etag, sizeof(p->etag));
-            }
+        if (blobExists) {
+            p->blobSize = blobSize;
 
-            if (blobSize > 0) {
-                int rc = bufferEnsure(p, blobSize);
+            if (blobSize > 0 && p->ops->page_blob_read) {
+                /* Fetch first page to detect page size from SQLite header */
+                size_t fetchLen = AZQLITE_DEFAULT_PAGE_SIZE;
+                if ((int64_t)fetchLen > blobSize) fetchLen = (size_t)blobSize;
+                azure_buffer_t buf = {0};
+                azure_error_t aerr2;
+                azure_error_init(&aerr2);
+                azure_err_t rarc = p->ops->page_blob_read(p->ops_ctx, zName,
+                                              0, fetchLen, &buf, &aerr2);
+                if (rarc != AZURE_OK) {
+                    sqlite3_free(p->zBlobName);
+                    p->zBlobName = NULL;
+                    return azureErrToSqlite(rarc, SQLITE_CANTOPEN);
+                }
+
+                /* Detect page size from the downloaded header */
+                int detectedPageSize = AZQLITE_DEFAULT_PAGE_SIZE;
+                if (buf.data && buf.size >= 100) {
+                    int detected = detectPageSize(buf.data, (sqlite3_int64)buf.size);
+                    if (detected > 0) detectedPageSize = detected;
+                }
+
+                /* Initialize cache with detected page size */
+                int rc = cacheInit(&p->cache, detectedPageSize, cacheGetMaxPages());
                 if (rc != SQLITE_OK) {
+                    free(buf.data);
                     sqlite3_free(p->zBlobName);
                     p->zBlobName = NULL;
                     return rc;
                 }
 
-                azure_buffer_t buf = {0};
-                azure_error_init(&aerr);
-                arc = p->ops->page_blob_read(p->ops_ctx, zName,
-                                              0, (size_t)blobSize,
-                                              &buf, &aerr);
-                if (arc != AZURE_OK) {
-                    free(p->aData);
-                    p->aData = NULL;
-                    free(p->aDirty);
-                    p->aDirty = NULL;
-                    sqlite3_free(p->zBlobName);
-                    p->zBlobName = NULL;
-                    return azureErrToSqlite(arc, SQLITE_CANTOPEN);
-                }
-
-                /* Copy downloaded data into our buffer */
+                /* Insert first page(s) into cache from the fetched data */
                 if (buf.data && buf.size > 0) {
-                    sqlite3_int64 copyLen = (sqlite3_int64)buf.size;
-                    if (copyLen > blobSize) copyLen = blobSize;
-                    memcpy(p->aData, buf.data, (size_t)copyLen);
-                    p->nData = copyLen;
+                    size_t off = 0;
+                    int pageNo = 0;
+                    while (off < buf.size) {
+                        unsigned char *pageData = (unsigned char *)calloc(1, (size_t)detectedPageSize);
+                        if (!pageData) {
+                            free(buf.data);
+                            cacheDestroy(&p->cache);
+                            sqlite3_free(p->zBlobName);
+                            p->zBlobName = NULL;
+                            return SQLITE_NOMEM;
+                        }
+                        size_t avail = buf.size - off;
+                        size_t toCopy = avail < (size_t)detectedPageSize ? avail : (size_t)detectedPageSize;
+                        memcpy(pageData, buf.data + off, toCopy);
+                        cacheInsert(&p->cache, pageNo, pageData, 0);
+                        off += (size_t)detectedPageSize;
+                        pageNo++;
+                    }
                 }
                 free(buf.data);
 
-                /* Detect page size from header */
-                int detected = detectPageSize(p->aData, p->nData);
-                if (detected > 0) p->pageSize = detected;
-
-                /* Re-ensure dirty bitmap with correct page size */
-                dirtyEnsureCapacity(p);
-
                 /* R2: Record initial Azure blob size to skip redundant resizes */
-                p->lastSyncedSize = p->nData;
+                p->lastSyncedSize = blobSize;
             } else {
-                p->nData = 0;
+                /* Empty blob or no read ops — init cache with default page size */
+                int rc = cacheInit(&p->cache, AZQLITE_DEFAULT_PAGE_SIZE, cacheGetMaxPages());
+                if (rc != SQLITE_OK) {
+                    sqlite3_free(p->zBlobName);
+                    p->zBlobName = NULL;
+                    return rc;
+                }
             }
         } else if (!blobExists && (flags & SQLITE_OPEN_CREATE)) {
             /* Create new page blob */
@@ -1498,9 +1852,8 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                     return azureErrToSqlite(arc, SQLITE_CANTOPEN);
                 }
             }
-            p->nData = 0;
-            /* Allocate initial buffer */
-            int rc = bufferEnsure(p, AZQLITE_INITIAL_ALLOC);
+            p->blobSize = 0;
+            int rc = cacheInit(&p->cache, AZQLITE_DEFAULT_PAGE_SIZE, cacheGetMaxPages());
             if (rc != SQLITE_OK) {
                 sqlite3_free(p->zBlobName);
                 p->zBlobName = NULL;
@@ -1511,8 +1864,6 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             p->zBlobName = NULL;
             return SQLITE_CANTOPEN;
         }
-
-        dirtyClearAll(p);
 
     } else if (isMainJournal) {
         /* MAIN_JOURNAL → Azure block blob */
