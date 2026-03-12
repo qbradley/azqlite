@@ -24,6 +24,7 @@ CFLAGS    = -Wall -Wextra -Wpedantic -std=c11 -O2
 CFLAGS   += -DSQLITE_THREADSAFE=1
 CFLAGS   += -DSQLITE_ENABLE_FTS5
 CFLAGS   += -DSQLITE_ENABLE_JSON1
+CFLAGS   += -D_POSIX_C_SOURCE=200809L
 
 # Include paths: our src/ dir + SQLite source dir
 CFLAGS   += -I$(SRC_DIR) -I$(SQLITE_DIR)
