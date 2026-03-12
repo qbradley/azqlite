@@ -12,6 +12,7 @@ How to decide who handles what.
 | SQLite VFS implementation | Aragorn ⚔️ | xOpen, xRead, xWrite, xSync, xLock, pager interaction |
 | C development | Aragorn ⚔️ | Build system, compilation, linking, memory management |
 | In-memory cache | Aragorn ⚔️ | Read cache design and implementation (MVP 2) |
+| Rust crates & FFI | Gimli 🪓 | Crate packaging, build.rs, FFI bindings, Rust samples |
 | Code review | Gandalf 🏗️ | Review PRs, check design integrity, approve/reject |
 | Testing | Samwise 🧪 | Write tests, crash recovery, durability, network failures |
 | Scope & priorities | Gandalf 🏗️ | What to build next, trade-offs, MVP sequencing |

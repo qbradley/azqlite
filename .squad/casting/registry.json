@@ -31,6 +31,14 @@
       "created_at": "2026-03-10T04:58:00Z",
       "legacy_named": false,
       "status": "active"
+    },
+    "gimli": {
+      "persistent_name": "Gimli",
+      "universe": "The Lord of the Rings",
+      "role": "Rust Dev",
+      "created_at": "2026-03-12T16:30:00Z",
+      "legacy_named": false,
+      "status": "active"
     }
   }
 }

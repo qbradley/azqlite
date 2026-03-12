@@ -319,3 +319,58 @@ Implemented two optimizations from the performance diagnosis (aragorn-perf-diagn
 **Test updates:** 3 WAL rejection tests updated: `vfs_pragma_wal_refused`→`vfs_pragma_wal_allowed` (WAL accepted with mock ops), `vfs_wal_mode_returns_delete` (tests rejection with NULL append ops), `vfs_wal_mode_case_insensitive` (WAL accepted for all case variants).
 
 **Result:** Clean build (zero warnings), all 207 unit tests pass. WAL mode is ready for integration testing once Frodo's production append blob client is available.
+
+### Phase 1: Journal State Per-File (2026-03-11)
+
+**Problem:** `azqliteVfsData` held a single `journalCacheState`/`journalBlobName[512]` pair — global state shared by all open databases. With multiple databases open simultaneously, journal cache state would cross-contaminate between them.
+
+**Solution:** Replaced the single journal cache entry with a fixed-capacity array of `azqliteJournalCacheEntry` structs (max 16), each holding `{state, zBlobName[512]}`. Added `journalCacheFind()` and `journalCacheGetOrCreate()` helpers for O(n) lookup by blob name. n ≤ 16, so linear scan is negligible.
+
+**Key design choices:**
+- Fixed array (not linked list) — no heap allocation, lives inside `g_vfsData`, zero-initialized by existing `memset`
+- New entries start with `state = -1` (unknown), matching old initialization semantics
+- `AZQLITE_MAX_JOURNAL_CACHE = 16` — more than enough for typical use; if exceeded, new journals simply skip caching (fall through to HEAD requests)
+- All 5 usage sites updated: xSync, xOpen (MAIN_JOURNAL), xDelete, xAccess, registration
+
+**Files modified:** `src/azqlite_vfs.c` only.
+
+**Result:** All 234 unit tests pass. No behavioral change from user perspective. Each database now has independent journal cache state.
+
+### Per-File Client Ownership + URI Parameter Parsing (2026-03-11)
+
+**Phase 2 + 3 combined** — each `azqliteFile` can now own its own `azure_client_t`.
+
+**Struct change:** Added `azure_client_t *ownClient` to `azqliteFile`. NULL means using the global VFS client (backward-compatible default).
+
+**URI parser:** `azqlite_parse_uri_config()` extracts `azure_account`, `azure_container`, `azure_sas`, `azure_key`, `azure_endpoint` from `sqlite3_filename` via `sqlite3_uri_parameter()`. Returns 1 if `azure_account` is present, 0 otherwise.
+
+**azqliteOpen flow:**
+1. `memset(p, 0, sizeof(azqliteFile))` — `ownClient` starts NULL
+2. If URI params found → `azure_client_create()` → set `p->ownClient`, derive `ops`/`ops_ctx` from it
+3. If not found → fall back to `pVfsData->ops` / `pVfsData->ops_ctx` (existing behavior, zero change)
+
+**azqliteClose:** If `p->ownClient != NULL`, calls `azure_client_destroy()` and nulls it. Placed after blob name free, before `pMethod = NULL`.
+
+**Key decisions:**
+- URI parsing before ops/ops_ctx assignment ensures clean ownership — the file either fully owns its client or fully uses the global one
+- `azure_client_create()` failure returns `SQLITE_CANTOPEN` (appropriate for a file-open failure)
+- No public API change — Phase 4 will add `azqlite_vfs_register_uri()`
+
+**Files modified:** `src/azqlite_vfs.c` only.
+
+**Result:** All 234 unit tests pass. Zero behavioral change when URI params not used.
+
+### Phase 4+5: URI-only VFS Registration + Shell/Benchmark Updates
+
+**What:** Added `azqlite_vfs_register_uri(int makeDefault)` — registers the azqlite VFS with no global Azure client. All databases must provide Azure config via URI parameters (`azure_account`, `azure_container`, `azure_sas`, etc.), or xOpen returns SQLITE_CANTOPEN.
+
+**Key changes:**
+- `src/azqlite.h` — Added `azqlite_vfs_register_uri()` declaration with full documentation of URI parameters
+- `src/azqlite_vfs.c` — Implemented `azqlite_vfs_register_uri()` (sets ops=NULL, ops_ctx=NULL, no client creation). Added NULL-ops guard in xOpen: when per-file URI parsing returns no config AND global ops are NULL, returns SQLITE_CANTOPEN instead of proceeding with NULL ops (crash prevention).
+- `src/azqlite_shell.c` — Added `--uri` flag. When present, calls `azqlite_vfs_register_uri(1)` and enables `SQLITE_CONFIG_URI` so the shell's `sqlite3_open()` honors URI filenames. Strips `--uri` from argv before forwarding to shell_main.
+- `benchmark/tpcc/tpcc.c` — Added `--uri`, `--account`, `--container`, `--sas`, `--endpoint` options. Constructs `file:tpcc.db?azure_account=...&azure_container=...&azure_sas=...` URI and calls `azqlite_vfs_register_uri(1)` with `SQLITE_OPEN_URI` flag.
+- `README.md` — Added "URI Configuration" section with code example, parameter table, and explanation.
+
+**Safety guard in xOpen:** After the URI-parse / global-fallback logic, if `p->ops` is still NULL (no URI params + no global client), we now return SQLITE_CANTOPEN immediately. Previously this would proceed with NULL ops and crash on first blob_exists call.
+
+**Result:** All 234 unit tests pass. Shell compiles and runs with `--uri`. TPC-C compiles with URI options.

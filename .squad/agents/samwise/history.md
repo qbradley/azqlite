@@ -12,7 +12,7 @@
 - Test network failures: Azure unreachable mid-write, partial writes, auth failures
 - Test locking: single writer, many readers (MVP 1), multi-machine (MVP 3-4)
 - License: MIT
-- **Test count:** 205 unit tests (196 original + 9 coalescing tests active, 1 gated behind ENABLE_COALESCE_TESTS)
+- **Test count:** 242 unit tests (234 previous + 8 URI config tests)
 
 ## Learnings
 
@@ -171,3 +171,29 @@ Completed Layer 2 infrastructure: 75 integration test cases written against Azur
   - **Setup pattern:** `wal_open_db()` does full 5-step WAL setup (register VFS, open DB, PRAGMA locking_mode=EXCLUSIVE, PRAGMA journal_mode=WAL, verify "wal"). Returns NULL on any step failure.
 - **Pre-existing test failures:** 3 old WAL-rejection tests (`vfs_pragma_wal_refused`, `vfs_wal_mode_returns_delete`, `vfs_wal_mode_case_insensitive`) now fail because Aragorn's in-progress VFS changes accept WAL mode. These need to be updated by Aragorn to reflect the new behavior.
 - **Handoff for Aragorn:** When WAL VFS support is ready, define `ENABLE_WAL_TESTS` and verify all 12 tests pass. Also update the 3 old WAL-rejection tests in test_vfs.c to match the new behavior (WAL accepted with append ops, rejected only when append ops are NULL).
+
+### Phase 6 — URI-Based Per-File Config Tests (2026-07-25)
+
+- **8 unit tests added** in `test/test_uri.c`, all passing (242 total unit tests).
+- **4 integration tests added** in `test/test_integration.c` under "URI Per-File Config" suite.
+- **Files created:** `test/test_uri.c`
+- **Files modified:** `test/test_main.c` (include + runner call), `test/test_integration.c` (4 tests + suite), `Makefile` (dependency list)
+- **Unit test categories:**
+  1. `uri_register_uri_no_global_client` — URI-only VFS, open without params returns CANTOPEN
+  2. `uri_parse_with_mock_fallback` — URI params present but stub client fails (CANTOPEN)
+  3. `uri_fallback_to_global` — No URI params falls back to global client (backward compat)
+  4. `uri_journal_cache_isolation` — Two DBs with independent journal cache entries
+  5. `uri_cantopen_no_ops_no_uri` — No ops + no URI = CANTOPEN regardless of URI flag
+  6. `uri_journal_cache_multiple_dbs` — 4 DBs with independent journal data
+  7. `uri_register_returns_ok` — Registration succeeds, VFS findable
+  8. `uri_reregister_with_ops` — Re-register URI VFS with global ops, open succeeds
+- **Integration test categories:**
+  1. `integ_uri_open_with_params` — Open DB via URI with Azurite credentials, insert/verify
+  2. `integ_multi_db_independent` — Two DBs same container, verify data independence
+  3. `integ_uri_two_containers` — Same blob name in different containers via URI, verify isolation
+  4. `integ_attach_cross_container` — ATTACH cross-container via URI (graceful skip if unsupported)
+- **Key design constraints:**
+  - Unit tests use `azure_client_stub.c` which returns `AZURE_ERR_UNKNOWN` from `azure_client_create()` — URI-based opens always fail in unit tests. Tests designed around this.
+  - Mock context pattern: `uri_ctx`/`uri_ops` static context, independent of other test files.
+  - Integration tests use Azurite well-known credentials and create/cleanup containers.
+  - `integ_attach_cross_container` is resilient — if ATTACH via URI is unsupported, it logs a note and passes (documents known limitation).

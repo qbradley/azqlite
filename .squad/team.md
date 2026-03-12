@@ -16,6 +16,7 @@
 | Frodo | Azure Expert | .squad/agents/frodo/charter.md | 🔵 |
 | Aragorn | SQLite/C Dev | .squad/agents/aragorn/charter.md | ⚔️ |
 | Samwise | QA | .squad/agents/samwise/charter.md | 🧪 |
+| Gimli | Rust Dev | .squad/agents/gimli/charter.md | 🪓 |
 | Scribe | Session Logger | .squad/agents/scribe/charter.md | 📋 |
 | Ralph | Work Monitor | — | 🔄 |
 
