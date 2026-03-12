@@ -42,11 +42,13 @@ static BenchmarkResult run_command(const char *cmd) {
   end_time = get_time_seconds();
   
   result.elapsed_seconds = end_time - start_time;
-  result.success = (WIFEXITED(rc) && (WEXITSTATUS(rc) == 0 || WEXITSTATUS(rc) == 1));
+  result.success = (WIFEXITED(rc) && WEXITSTATUS(rc) == 0);
   
   if (!result.success) {
+    int exit_code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+    fprintf(stderr, "Warning: command exited with non-zero status %d\n", exit_code);
     snprintf(result.error_msg, sizeof(result.error_msg), 
-             "Command failed with status %d", rc);
+             "Command failed with exit status %d", exit_code);
   }
   
   return result;

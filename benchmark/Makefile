@@ -83,15 +83,18 @@ $(BENCHMARK_BIN): $(BENCH_SRC) | $(BENCH_BUILD)
 	$(CC) $(CFLAGS) -o $@ $(BENCH_SRC)
 
 # Build speedtest1 with default SQLite
+# -w suppresses warnings from third-party speedtest1.c (SQLite test harness)
 $(SPEEDTEST1_BIN): speedtest1.c $(SQLITE_OBJ) | $(BENCH_BUILD)
 	$(CC) $(CFLAGS) -w -o $@ speedtest1.c $(SQLITE_OBJ) $(LDFLAGS)
 
 # Build speedtest1 with azqlite VFS (stub)
+# -w needed because speedtest1_wrapper.c #includes third-party speedtest1.c
 $(SPEEDTEST1_AZURE_BIN): speedtest1_wrapper.c speedtest1.c $(SQLITE_OBJ) $(VFS_STUB_OBJS) | $(BENCH_BUILD)
 	$(CC) $(CFLAGS) -w -o $@ speedtest1_wrapper.c \
 		$(SQLITE_OBJ) $(VFS_STUB_OBJS) $(LDFLAGS)
 
 # Build all with production Azure client
+# -w needed because speedtest1_wrapper.c #includes third-party speedtest1.c
 all-production: $(BENCHMARK_BIN) $(SPEEDTEST1_BIN) $(SQLITE_OBJ) $(VFS_PROD_OBJS) | $(BENCH_BUILD)
 	$(CC) $(CFLAGS_PROD) -w -o $(SPEEDTEST1_AZURE_BIN) speedtest1_wrapper.c \
 		$(SQLITE_OBJ) $(VFS_PROD_OBJS) $(LDFLAGS_PROD)

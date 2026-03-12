@@ -15,6 +15,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include "sqlite3.h"
+#include "azqlite.h"
 #include "tpcc_schema.h"
 
 /* Forward declarations from other TPC-C modules */
@@ -176,8 +177,8 @@ static int run_benchmark(benchmark_config_t *config) {
   if (config->use_azure) {
 #ifdef AZQLITE_VFS_AVAILABLE
     /* Register azqlite VFS */
-    extern int azqlite_vfs_register(void);
-    rc = azqlite_vfs_register();
+
+    rc = azqlite_vfs_register(1);
     if (rc != SQLITE_OK) {
       fprintf(stderr, "Failed to register azqlite VFS\n");
       return 1;

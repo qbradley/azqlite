@@ -49,7 +49,7 @@ CFLAGS_PROD  = $(CFLAGS) $(OPENSSL_CFLAGS) $(CURL_CFLAGS)
 LDFLAGS_PROD = $(LDFLAGS) $(CURL_LDFLAGS) $(OPENSSL_LDFLAGS)
 
 # Test-specific CFLAGS (suppress GNU extension warning in test harness)
-TEST_CFLAGS = $(CFLAGS) -I$(TEST_DIR)
+TEST_CFLAGS = $(CFLAGS) $(OPENSSL_CFLAGS) -I$(TEST_DIR)
 
 # ---------- Sources ----------
 
@@ -79,9 +79,10 @@ PROD_LIBRARY   = $(BUILD_DIR)/libazqlite.a
 SHELL_SRC   = $(SRC_DIR)/azqlite_shell.c
 SHELL_BIN   = azqlite-shell
 
-# Test objects — tests link against mock + stub (VFS refs production client API)
+# Test objects — tests link against mock + stub + auth + error modules
 MOCK_OBJ    = $(BUILD_DIR)/mock_azure_ops.o
-TEST_OBJS   = $(SQLITE_OBJ) $(BUILD_DIR)/azqlite_vfs.o $(BUILD_DIR)/azure_client_stub.o $(MOCK_OBJ)
+TEST_OBJS   = $(SQLITE_OBJ) $(BUILD_DIR)/azqlite_vfs.o $(BUILD_DIR)/azure_client_stub.o $(MOCK_OBJ) \
+              $(BUILD_DIR)/azure_auth.o $(BUILD_DIR)/azure_error.o
 
 # ---------- Default target ----------
 
@@ -167,7 +168,7 @@ test-unit: $(BUILD_DIR)/test_main
 	@echo "=== All unit tests passed ==="
 
 $(BUILD_DIR)/test_main: $(TEST_DIR)/test_main.c $(TEST_DIR)/test_vfs.c $(TEST_DIR)/test_azure_client.c $(TEST_DIR)/test_coalesce.c $(TEST_DIR)/test_wal.c $(TEST_DIR)/mock_azure_ops.h $(TEST_DIR)/test_harness.h $(TEST_OBJS) | $(BUILD_DIR)
-	$(CC) $(TEST_CFLAGS) -DENABLE_VFS_INTEGRATION -DENABLE_WAL_TESTS -o $@ $(TEST_DIR)/test_main.c $(TEST_OBJS) $(LDFLAGS)
+	$(CC) $(TEST_CFLAGS) -DENABLE_VFS_INTEGRATION -DENABLE_WAL_TESTS -DENABLE_AZURE_CLIENT_TESTS -o $@ $(TEST_DIR)/test_main.c $(TEST_OBJS) $(LDFLAGS) $(OPENSSL_LDFLAGS)
 
 # Layer 2: Integration tests (requires Azurite)
 # These tests link against the REAL azure_client.c (not stubs/mocks)

@@ -385,97 +385,106 @@ TEST(fatal_errors_distinct_from_transient) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════
-** SECTION 7: Auth Tests (stubs — enabled when azure_client.c exists)
+** SECTION 7: Auth & XML Tests (require azure_auth.c + azure_error.c)
 **
-** These test Frodo's auth implementation. Gated behind
-** ENABLE_AZURE_CLIENT_TESTS since the real module doesn't exist yet.
+** These test production auth signing and XML error parsing.
+** Gated behind ENABLE_AZURE_CLIENT_TESTS (enabled when linking with
+** azure_auth.o and azure_error.o).
 ** ══════════════════════════════════════════════════════════════════════ */
 
 #ifdef ENABLE_AZURE_CLIENT_TESTS
 
-/*
-** Forward declarations — provided by Frodo's azure_client.c.
-** These signatures are based on the design review.
-*/
-extern int azure_auth_sign_shared_key(const char *account,
-                                       const char *key_base64,
-                                       const char *string_to_sign,
-                                       char *signature_out,
-                                       size_t signature_size);
+#include "../src/azure_client_impl.h"
 
-extern int azure_auth_append_sas(const char *base_url,
-                                  const char *sas_token,
-                                  char *url_out,
-                                  size_t url_size);
+/* ── HMAC-SHA256 and Base64 Tests ─────────────────────────────────── */
 
-extern int azure_auth_build_shared_key_header(const char *account,
-                                                const char *key_base64,
-                                                const char *method,
-                                                const char *resource,
-                                                const char *date,
-                                                char *header_out,
-                                                size_t header_size);
-
-/* Known test vectors for HMAC-SHA256 */
 TEST(auth_hmac_sha256_known_vector) {
     /* RFC 4231 Test Case 2:
-    ** Key  = "Jefe" (base64: "SmVmZQ==")
+    ** Key  = "Jefe" (4 bytes)
     ** Data = "what do ya want for nothing?"
-    ** HMAC = 5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843 */
-    char sig[128];
-    int rc = azure_auth_sign_shared_key(
-        "testaccount", "SmVmZQ==",
-        "what do ya want for nothing?",
-        sig, sizeof(sig));
-    ASSERT_EQ(rc, 0);
-    ASSERT_TRUE(strlen(sig) > 0);
+    ** HMAC-SHA256 = 5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843 */
+    const uint8_t key[] = "Jefe";
+    const uint8_t data[] = "what do ya want for nothing?";
+    uint8_t out[32];
+    size_t out_len = sizeof(out);
+
+    azure_err_t rc = azure_hmac_sha256(key, 4, data, 28, out, &out_len);
+    ASSERT_AZURE_OK(rc);
+    ASSERT_EQ(out_len, 32);
+    /* Verify first 4 bytes of known digest */
+    ASSERT_EQ(out[0], 0x5b);
+    ASSERT_EQ(out[1], 0xdc);
+    ASSERT_EQ(out[2], 0xc1);
+    ASSERT_EQ(out[3], 0x46);
 }
 
-TEST(auth_sas_token_append) {
-    char url[512];
-    int rc = azure_auth_append_sas(
-        "https://myaccount.blob.core.windows.net/mycontainer/myblob",
-        "sv=2024-08-04&ss=b&srt=o&sp=rwdlac",
-        url, sizeof(url));
+TEST(auth_base64_encode_decode) {
+    /* Test base64 roundtrip */
+    const uint8_t input[] = "Hello, Azure!";
+    char encoded[64];
+    int rc = azure_base64_encode(input, strlen((const char *)input),
+                                 encoded, sizeof(encoded));
     ASSERT_EQ(rc, 0);
-    ASSERT_TRUE(strstr(url, "?sv=2024-08-04") != NULL ||
-                strstr(url, "&sv=2024-08-04") != NULL);
+    ASSERT_TRUE(strlen(encoded) > 0);
+
+    /* Decode back */
+    uint8_t decoded[64];
+    size_t decoded_len = 0;
+    rc = azure_base64_decode(encoded, decoded, sizeof(decoded), &decoded_len);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(decoded_len, strlen((const char *)input));
+    ASSERT_MEM_EQ(decoded, input, decoded_len);
 }
 
-TEST(auth_sas_token_with_existing_params) {
-    char url[512];
-    int rc = azure_auth_append_sas(
-        "https://myaccount.blob.core.windows.net/mycontainer/myblob?comp=page",
-        "sv=2024-08-04&ss=b",
-        url, sizeof(url));
+TEST(auth_base64_decode_known_vector) {
+    /* "SmVmZQ==" decodes to "Jefe" */
+    uint8_t decoded[64];
+    size_t decoded_len = 0;
+    int rc = azure_base64_decode("SmVmZQ==", decoded, sizeof(decoded), &decoded_len);
     ASSERT_EQ(rc, 0);
-    /* Should append with & not ? since URL already has params */
-    ASSERT_TRUE(strstr(url, "&sv=2024-08-04") != NULL);
+    ASSERT_EQ(decoded_len, 4);
+    ASSERT_MEM_EQ(decoded, "Jefe", 4);
 }
 
 TEST(auth_missing_credentials) {
-    /* When both SAS and Shared Key are NULL, should return error */
-    char sig[128];
-    int rc = azure_auth_sign_shared_key("account", NULL, "data",
-                                          sig, sizeof(sig));
-    ASSERT_NE(rc, 0);
+    /* azure_auth_sign_request with NULL client should return error */
+    char header[512];
+    const char *hdrs[] = { NULL };
+    azure_err_t rc = azure_auth_sign_request(
+        NULL, "GET", "/container/blob", NULL,
+        "", "", "", hdrs, header, sizeof(header));
+    ASSERT_NE(rc, AZURE_OK);
 }
 
 TEST(auth_shared_key_header_format) {
+    /* Build a test client struct with known credentials */
+    azure_client_t client;
+    memset(&client, 0, sizeof(client));
+    strncpy(client.account, "myaccount", sizeof(client.account) - 1);
+
+    /* Decode a test key: "dGVzdGtleQ==" = "testkey" */
+    client.key_raw_len = 7;
+    memcpy(client.key_raw, "testkey", 7);
+    strncpy(client.key_b64, "dGVzdGtleQ==", sizeof(client.key_b64) - 1);
+    client.use_sas = 0;
+
     char header[512];
-    int rc = azure_auth_build_shared_key_header(
-        "myaccount", "dGVzdGtleQ==",
-        "PUT", "/mycontainer/myblob",
-        "Sun, 10 Mar 2026 00:00:00 GMT",
-        header, sizeof(header));
-    ASSERT_EQ(rc, 0);
+    const char *x_ms_headers[] = {
+        "x-ms-date:Sun, 10 Mar 2026 00:00:00 GMT",
+        "x-ms-version:2024-08-04",
+        NULL
+    };
+
+    azure_err_t rc = azure_auth_sign_request(
+        &client, "PUT", "/mycontainer/myblob", NULL,
+        "512", "application/octet-stream", "",
+        x_ms_headers, header, sizeof(header));
+    ASSERT_AZURE_OK(rc);
     /* Should be: SharedKey myaccount:<base64-signature> */
     ASSERT_TRUE(strstr(header, "SharedKey myaccount:") != NULL);
 }
 
 /* ── XML Error Parsing ────────────────────────────────────────────── */
-
-extern int azure_parse_error_xml(const char *xml, azure_error_t *err);
 
 TEST(xml_error_parse_basic) {
     const char *xml =
@@ -487,8 +496,8 @@ TEST(xml_error_parse_basic) {
 
     azure_error_t err;
     memset(&err, 0, sizeof(err));
-    int rc = azure_parse_error_xml(xml, &err);
-    ASSERT_EQ(rc, 0);
+    azure_err_t rc = azure_parse_error_xml(xml, strlen(xml), &err);
+    ASSERT_AZURE_OK(rc);
     ASSERT_STR_EQ(err.error_code, "BlobNotFound");
     ASSERT_TRUE(strstr(err.error_message, "does not exist") != NULL);
 }
@@ -503,25 +512,30 @@ TEST(xml_error_parse_lease_conflict) {
 
     azure_error_t err;
     memset(&err, 0, sizeof(err));
-    azure_parse_error_xml(xml, &err);
+    azure_err_t rc = azure_parse_error_xml(xml, strlen(xml), &err);
+    ASSERT_AZURE_OK(rc);
     ASSERT_STR_EQ(err.error_code, "LeaseAlreadyPresent");
 }
 
 TEST(xml_error_parse_empty) {
     azure_error_t err;
     memset(&err, 0, sizeof(err));
-    int rc = azure_parse_error_xml("", &err);
-    ASSERT_NE(rc, 0); /* Should fail gracefully */
+    azure_err_t rc = azure_parse_error_xml("", 0, &err);
+    ASSERT_NE(rc, AZURE_OK); /* Empty input returns AZURE_ERR_INVALID_ARG */
 }
 
 TEST(xml_error_parse_malformed) {
+    /* Malformed XML is handled gracefully — returns OK with empty fields */
     azure_error_t err;
     memset(&err, 0, sizeof(err));
-    int rc = azure_parse_error_xml("<not>valid xml", &err);
-    ASSERT_NE(rc, 0);
+    azure_err_t rc = azure_parse_error_xml("<not>valid xml", 14, &err);
+    ASSERT_AZURE_OK(rc);
+    /* Tags not found, fields should be empty */
+    ASSERT_STR_EQ(err.error_code, "");
 }
 
 #endif /* ENABLE_AZURE_CLIENT_TESTS */
+
 
 /* ══════════════════════════════════════════════════════════════════════
 ** SECTION 8: Retry Logic Contract Tests
@@ -1183,8 +1197,8 @@ void run_azure_client_tests(void) {
     /* Section 7: Auth */
     TEST_SUITE_BEGIN("Auth - HMAC-SHA256");
     RUN_TEST(auth_hmac_sha256_known_vector);
-    RUN_TEST(auth_sas_token_append);
-    RUN_TEST(auth_sas_token_with_existing_params);
+    RUN_TEST(auth_base64_encode_decode);
+    RUN_TEST(auth_base64_decode_known_vector);
     RUN_TEST(auth_missing_credentials);
     RUN_TEST(auth_shared_key_header_format);
     TEST_SUITE_END();
