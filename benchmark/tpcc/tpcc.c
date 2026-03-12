@@ -59,8 +59,39 @@ typedef struct {
   char *uri_container;
   char *uri_sas;
   char *uri_endpoint;
-  char uri_db_path[1024];  /* constructed URI string */
+  char uri_db_path[4096];  /* constructed URI string (large for encoded SAS) */
 } benchmark_config_t;
+
+/*
+** Percent-encode a URI query parameter value.
+** SAS tokens contain '&' and '=' which break SQLite URI parameter parsing.
+** Returns malloc'd string that caller must free, or NULL on OOM.
+*/
+static char *uri_encode_query_value(const char *input) {
+  static const char hex[] = "0123456789ABCDEF";
+  if (!input) return NULL;
+  size_t len = strlen(input);
+  /* Worst case: every char needs encoding (3x expansion) */
+  char *output = malloc(len * 3 + 1);
+  if (!output) return NULL;
+  size_t j = 0;
+  for (size_t i = 0; input[i]; i++) {
+    unsigned char c = (unsigned char)input[i];
+    /* RFC 3986 unreserved characters — safe in query values */
+    int unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                     (c >= '0' && c <= '9') ||
+                     c == '-' || c == '.' || c == '_' || c == '~';
+    if (unreserved) {
+      output[j++] = (char)c;
+    } else {
+      output[j++] = '%';
+      output[j++] = hex[c >> 4];
+      output[j++] = hex[c & 0x0F];
+    }
+  }
+  output[j] = '\0';
+  return output;
+}
 
 /* Initialize transaction stats */
 static void init_stats(txn_stats_t *stats) {
@@ -616,13 +647,26 @@ int main(int argc, char **argv) {
       fprintf(stderr, "Error: --uri requires --sas\n");
       return 1;
     }
-    /* Construct URI: file:tpcc.db?azure_account=...&azure_container=...&azure_sas=... */
+    /* Percent-encode URI parameter values — SAS tokens contain '&' and '='
+    ** which would be misinterpreted as URI parameter delimiters by SQLite */
+    char *enc_sas = uri_encode_query_value(config.uri_sas);
+    if (!enc_sas) {
+      fprintf(stderr, "Error: failed to encode SAS token\n");
+      return 1;
+    }
     int n = snprintf(config.uri_db_path, sizeof(config.uri_db_path),
                      "file:tpcc.db?azure_account=%s&azure_container=%s&azure_sas=%s",
-                     config.uri_account, config.uri_container, config.uri_sas);
+                     config.uri_account, config.uri_container, enc_sas);
+    free(enc_sas);
     if (config.uri_endpoint) {
-      snprintf(config.uri_db_path + n, sizeof(config.uri_db_path) - n,
-               "&azure_endpoint=%s", config.uri_endpoint);
+      char *enc_endpoint = uri_encode_query_value(config.uri_endpoint);
+      if (!enc_endpoint) {
+        fprintf(stderr, "Error: failed to encode endpoint\n");
+        return 1;
+      }
+      snprintf(config.uri_db_path + n, sizeof(config.uri_db_path) - (size_t)n,
+               "&azure_endpoint=%s", enc_endpoint);
+      free(enc_endpoint);
     }
     config.db_path = config.uri_db_path;
   } else if (config.use_azure) {

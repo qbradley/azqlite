@@ -17,6 +17,10 @@
 **
 ** URI mode (no environment variables needed):
 **   ./azqlite-shell --uri "file:mydb.db?azure_account=acct&azure_container=cont&azure_sas=tok"
+**
+** NOTE: SAS tokens contain '&' which is a URI delimiter. When using --uri,
+** percent-encode '&' as '%26' in the SAS token value, e.g.:
+**   azure_sas=sv%3D2024-08-04%26ss%3Db%26srt%3Dsco%26sp%3Drwdlacitfx%26...
 */
 
 #include <stdio.h>
