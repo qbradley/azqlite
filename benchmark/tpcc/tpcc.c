@@ -632,11 +632,11 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[i], "--skip-load") == 0) {
       config.skip_load = 1;
     } else if (strcmp(argv[i], "--prefetch") == 0) {
-      if (++i >= argc) {
-        fprintf(stderr, "Error: --prefetch requires an argument (off, all, index, warm, or page count)\n");
-        return 1;
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        config.prefetch = argv[++i];
+      } else {
+        config.prefetch = "all";
       }
-      config.prefetch = argv[i];
     } else if (strcmp(argv[i], "--help") == 0) {
       print_usage(argv[0]);
       return 0;
