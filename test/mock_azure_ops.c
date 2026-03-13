@@ -92,6 +92,9 @@ typedef struct {
     int                lease_duration;
     time_t             lease_acquired_at;
     int                break_period;
+
+    /* ETag tracking (incremented on every mutation) */
+    int                etag_version;
 } mock_blob_t;
 
 /* ── Failure injection ────────────────────────────────────────────── */
@@ -149,7 +152,18 @@ static mock_blob_t *create_blob(mock_azure_ctx_t *ctx, const char *name,
     strncpy(b->name, name, BLOB_NAME_LEN - 1);
     b->type = type;
     b->lease_state = LEASE_AVAILABLE;
+    b->etag_version = 1;
     return b;
+}
+
+/* Generate an ETag string from the blob's version counter */
+static void mock_generate_etag(mock_blob_t *b, char *out, size_t size) {
+    snprintf(out, size, "\"0x%08X\"", b->etag_version);
+}
+
+/* Set etag on azure_error_t from blob */
+static void mock_set_etag(mock_blob_t *b, azure_error_t *err) {
+    if (err) mock_generate_etag(b, err->etag, sizeof(err->etag));
 }
 
 static void free_blob_data(mock_blob_t *b) {
@@ -262,6 +276,8 @@ static azure_err_t mock_page_blob_create(void *vctx, const char *name,
             return AZURE_ERR_NOMEM;
         }
         b->size = size;
+        b->etag_version++;
+        mock_set_etag(b, err);
         return AZURE_OK;
     }
 
@@ -278,6 +294,7 @@ static azure_err_t mock_page_blob_create(void *vctx, const char *name,
         }
     }
     b->size = size;
+    mock_set_etag(b, err);
     return AZURE_OK;
 }
 
@@ -319,6 +336,8 @@ static azure_err_t mock_page_blob_write(void *vctx, const char *name,
     }
 
     memcpy(b->data + offset, data, len);
+    b->etag_version++;
+    mock_set_etag(b, err);
 
     /* Record this write for coalescing tests */
     if (ctx->write_record_count < MOCK_MAX_WRITE_RECORDS) {
@@ -509,6 +528,7 @@ static azure_err_t mock_blob_get_properties(void *vctx, const char *name,
             strcpy(lease_status_out, "unlocked");
     }
 
+    mock_set_etag(b, err);
     return AZURE_OK;
 }
 

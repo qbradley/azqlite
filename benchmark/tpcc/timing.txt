@@ -1,0 +1,182 @@
+[TIMING] HTTP HEAD tpcc.db: 118.9ms (dns=11.5ms tcp=28.8ms tls=89.3ms NEW) body=0 req#1
+[TIMING] HTTP GET tpcc.db: 37181.8ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#2
+[PREFETCH] strategy=all fetched=24494 pages (95.7MB) of 100327424 total (95.7MB) in 37250.3ms
+[TIMING] HTTP HEAD tpcc.db-journal: 27.7ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#3
+[TIMING] HTTP HEAD tpcc.db-wal: 19.1ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#4
+[TIMING] HTTP PUT tpcc.db: 24.7ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#5
+[TIMING] lease_acquire: 24.7ms (lock=4, blob=tpcc.db)
+[TIMING] HTTP HEAD tpcc.db-wal: 100.5ms (dns=2.2ms tcp=19.3ms tls=71.1ms NEW) body=0 req#6
+[TIMING] HTTP PUT tpcc.db-wal: 27.2ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#7
+[TIMING] HTTP PUT tpcc.db-wal: 21.2ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=32 req#8
+[TIMING] HTTP PUT tpcc.db-wal: 359.2ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4124120 req#9
+[TIMING] HTTP PUT tpcc.db: 26.2ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#10
+[TIMING] batch_multi: 683.8ms attempt=0 handles=517 completed=517/517 (reuse=8 new=2)
+[TIMING] xSync(db): total=699.3ms | resize=0.0ms coalesce=2.6ms write_batch=696.7ms | dirty_pages=554 ranges=517 bytes=2269184 reads_since_sync=1439 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 23.2ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#11
+[TIMING] HTTP PUT tpcc.db-wal: 29.0ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#12
+[TIMING] HTTP PUT tpcc.db-wal: 292.5ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4124152 req#13
+[TIMING] HTTP DELETE tpcc.db-wal: 22.5ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#14
+[TIMING] HTTP PUT tpcc.db-wal: 23.3ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#15
+[TIMING] HTTP PUT tpcc.db-wal: 449.5ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#16
+[TIMING] HTTP PUT tpcc.db-wal: 26.6ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=49328 req#17
+[TIMING] HTTP PUT tpcc.db: 20.4ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#18
+[TIMING] batch_multi: 491.4ms attempt=0 handles=526 completed=526/526 (reuse=16 new=2)
+[TIMING] xSync(db): total=509.8ms | resize=0.0ms coalesce=2.9ms write_batch=506.9ms | dirty_pages=570 ranges=526 bytes=2334720 reads_since_sync=1050 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 23.5ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#19
+[TIMING] HTTP PUT tpcc.db-wal: 26.2ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#20
+[TIMING] HTTP PUT tpcc.db-wal: 340.5ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#21
+[TIMING] HTTP PUT tpcc.db-wal: 91.6ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=49328 req#22
+[TIMING] HTTP DELETE tpcc.db-wal: 21.6ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#23
+[TIMING] HTTP PUT tpcc.db-wal: 24.8ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#24
+[TIMING] HTTP PUT tpcc.db-wal: 334.3ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#25
+[TIMING] HTTP PUT tpcc.db-wal: 32.6ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=49328 req#26
+[TIMING] HTTP PUT tpcc.db: 21.7ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#27
+[TIMING] batch_multi: 515.4ms attempt=0 handles=557 completed=557/557 (reuse=25 new=2)
+[TIMING] xSync(db): total=532.5ms | resize=0.0ms coalesce=1.4ms write_batch=531.1ms | dirty_pages=587 ranges=557 bytes=2404352 reads_since_sync=838 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 24.4ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#28
+[TIMING] HTTP PUT tpcc.db-wal: 26.9ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#29
+[TIMING] HTTP PUT tpcc.db-wal: 395.1ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#30
+[TIMING] HTTP PUT tpcc.db-wal: 26.3ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=49328 req#31
+[TIMING] HTTP DELETE tpcc.db-wal: 20.8ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#32
+[TIMING] HTTP PUT tpcc.db-wal: 24.1ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#33
+[TIMING] HTTP PUT tpcc.db-wal: 404.2ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#34
+[TIMING] HTTP PUT tpcc.db-wal: 90.6ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=69928 req#35
+[TIMING] HTTP PUT tpcc.db: 23.6ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#36
+[TIMING] batch_multi: 444.5ms attempt=0 handles=505 completed=505/505 (reuse=34 new=2)
+[TIMING] xSync(db): total=463.8ms | resize=0.0ms coalesce=3.0ms write_batch=460.8ms | dirty_pages=549 ranges=505 bytes=2248704 reads_since_sync=682 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 24.4ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#37
+[TIMING] HTTP PUT tpcc.db-wal: 26.9ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#38
+[TIMING] HTTP PUT tpcc.db-wal: 464.2ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#39
+[TIMING] HTTP PUT tpcc.db-wal: 93.8ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=69928 req#40
+[TIMING] HTTP DELETE tpcc.db-wal: 24.2ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#41
+[TIMING] HTTP PUT tpcc.db-wal: 24.4ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#42
+[TIMING] HTTP PUT tpcc.db-wal: 420.2ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#43
+[TIMING] HTTP PUT tpcc.db-wal: 54.8ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=255328 req#44
+[TIMING] HTTP PUT tpcc.db: 22.3ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#45
+[TIMING] batch_multi: 499.9ms attempt=0 handles=547 completed=547/547 (reuse=43 new=2)
+[TIMING] xSync(db): total=520.2ms | resize=0.0ms coalesce=3.1ms write_batch=517.1ms | dirty_pages=595 ranges=547 bytes=2437120 reads_since_sync=682 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 21.0ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#46
+[TIMING] HTTP PUT tpcc.db-wal: 25.9ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#47
+[TIMING] HTTP PUT tpcc.db-wal: 414.8ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#48
+[TIMING] HTTP PUT tpcc.db-wal: 57.1ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=255328 req#49
+[TIMING] HTTP DELETE tpcc.db-wal: 22.9ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#50
+[TIMING] HTTP PUT tpcc.db-wal: 27.4ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#51
+[TIMING] HTTP PUT tpcc.db-wal: 404.7ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#52
+[TIMING] HTTP PUT tpcc.db-wal: 51.8ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=255328 req#53
+[TIMING] HTTP PUT tpcc.db: 24.3ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#54
+[TIMING] batch_multi: 475.0ms attempt=0 handles=534 completed=534/534 (reuse=52 new=2)
+[TIMING] xSync(db): total=496.2ms | resize=0.0ms coalesce=2.8ms write_batch=493.4ms | dirty_pages=564 ranges=534 bytes=2310144 reads_since_sync=535 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 25.2ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#55
+[TIMING] HTTP PUT tpcc.db-wal: 24.1ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#56
+[TIMING] HTTP PUT tpcc.db-wal: 446.7ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#57
+[TIMING] HTTP PUT tpcc.db-wal: 49.5ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=255328 req#58
+[TIMING] HTTP DELETE tpcc.db-wal: 26.6ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#59
+[TIMING] HTTP PUT tpcc.db-wal: 23.3ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#60
+[TIMING] HTTP PUT tpcc.db-wal: 489.1ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#61
+[TIMING] HTTP PUT tpcc.db-wal: 137.8ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#62
+[TIMING] HTTP PUT tpcc.db: 25.1ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#63
+[TIMING] batch_multi: 597.1ms attempt=0 handles=601 completed=601/601 (reuse=61 new=2)
+[TIMING] xSync(db): total=617.6ms | resize=0.0ms coalesce=3.4ms write_batch=614.2ms | dirty_pages=644 ranges=601 bytes=2637824 reads_since_sync=554 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 33.0ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#64
+[TIMING] HTTP PUT tpcc.db-wal: 34.3ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#65
+[TIMING] HTTP PUT tpcc.db-wal: 495.7ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#66
+[TIMING] HTTP PUT tpcc.db-wal: 75.9ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#67
+[TIMING] HTTP DELETE tpcc.db-wal: 22.0ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#68
+[TIMING] HTTP PUT tpcc.db-wal: 25.9ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#69
+[TIMING] HTTP PUT tpcc.db-wal: 783.1ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#70
+[TIMING] HTTP PUT tpcc.db-wal: 89.9ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#71
+[TIMING] HTTP PUT tpcc.db: 31.4ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#72
+[TIMING] batch_multi: 650.5ms attempt=0 handles=550 completed=550/550 (reuse=70 new=2)
+[TIMING] xSync(db): total=670.2ms | resize=0.0ms coalesce=3.2ms write_batch=667.0ms | dirty_pages=581 ranges=550 bytes=2379776 reads_since_sync=489 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 26.1ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#73
+[TIMING] HTTP PUT tpcc.db-wal: 36.5ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#74
+[TIMING] HTTP PUT tpcc.db-wal: 517.3ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#75
+[TIMING] HTTP PUT tpcc.db-wal: 74.4ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#76
+[TIMING] HTTP DELETE tpcc.db-wal: 28.8ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#77
+[TIMING] HTTP PUT tpcc.db-wal: 26.4ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#78
+[TIMING] HTTP PUT tpcc.db-wal: 513.3ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#79
+[TIMING] HTTP PUT tpcc.db-wal: 78.7ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#80
+[TIMING] HTTP PUT tpcc.db: 24.8ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#81
+[TIMING] batch_multi: 664.3ms attempt=0 handles=515 completed=515/515 (reuse=79 new=2)
+[TIMING] xSync(db): total=684.4ms | resize=0.0ms coalesce=3.0ms write_batch=681.5ms | dirty_pages=551 ranges=515 bytes=2256896 reads_since_sync=409 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 26.2ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#82
+[TIMING] HTTP PUT tpcc.db-wal: 24.0ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#83
+[TIMING] HTTP PUT tpcc.db-wal: 567.6ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#84
+[TIMING] HTTP PUT tpcc.db-wal: 226.6ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#85
+[TIMING] HTTP DELETE tpcc.db-wal: 27.9ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#86
+[TIMING] HTTP PUT tpcc.db-wal: 38.0ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#87
+[TIMING] HTTP PUT tpcc.db-wal: 556.9ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#88
+[TIMING] HTTP PUT tpcc.db-wal: 76.2ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#89
+[TIMING] HTTP PUT tpcc.db: 21.0ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#90
+[TIMING] HTTP PUT tpcc.db: 26.9ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#91
+[TIMING] batch_multi: 593.2ms attempt=0 handles=515 completed=515/515 (reuse=89 new=2)
+[TIMING] xSync(db): total=616.5ms | resize=0.0ms coalesce=3.7ms write_batch=612.8ms | dirty_pages=559 ranges=515 bytes=2289664 reads_since_sync=389 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 26.7ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#92
+[TIMING] HTTP PUT tpcc.db-wal: 65.7ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#93
+[TIMING] HTTP PUT tpcc.db-wal: 526.1ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#94
+[TIMING] HTTP PUT tpcc.db-wal: 108.1ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#95
+[TIMING] HTTP DELETE tpcc.db-wal: 25.0ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#96
+[TIMING] HTTP PUT tpcc.db-wal: 27.4ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#97
+[TIMING] HTTP PUT tpcc.db-wal: 513.8ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#98
+[TIMING] HTTP PUT tpcc.db-wal: 110.6ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#99
+[TIMING] HTTP PUT tpcc.db: 28.5ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#100
+[TIMING] batch_multi: 1072.6ms attempt=0 handles=520 completed=520/520 (reuse=98 new=2)
+[TIMING] xSync(db): total=1094.2ms | resize=0.0ms coalesce=3.0ms write_batch=1091.3ms | dirty_pages=558 ranges=520 bytes=2285568 reads_since_sync=339 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 40.9ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#101
+[TIMING] HTTP PUT tpcc.db-wal: 28.4ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#102
+[TIMING] HTTP PUT tpcc.db-wal: 851.3ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#103
+[TIMING] HTTP PUT tpcc.db-wal: 106.3ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#104
+[TIMING] HTTP DELETE tpcc.db-wal: 35.3ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#105
+[TIMING] HTTP PUT tpcc.db-wal: 36.2ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#106
+[TIMING] HTTP PUT tpcc.db-wal: 770.9ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#107
+[TIMING] HTTP PUT tpcc.db-wal: 150.8ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#108
+[TIMING] HTTP PUT tpcc.db: 27.1ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#109
+[TIMING] batch_multi: 662.2ms attempt=0 handles=556 completed=556/556 (reuse=107 new=2)
+[TIMING] xSync(db): total=680.2ms | resize=0.0ms coalesce=3.0ms write_batch=677.2ms | dirty_pages=602 ranges=556 bytes=2465792 reads_since_sync=371 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 23.8ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#110
+[TIMING] HTTP PUT tpcc.db-wal: 31.3ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#111
+[TIMING] HTTP PUT tpcc.db-wal: 703.5ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#112
+[TIMING] HTTP PUT tpcc.db-wal: 85.3ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#113
+[TIMING] HTTP DELETE tpcc.db-wal: 25.7ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#114
+[TIMING] HTTP PUT tpcc.db-wal: 37.6ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#115
+[TIMING] HTTP PUT tpcc.db-wal: 741.5ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#116
+[TIMING] HTTP PUT tpcc.db-wal: 89.8ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#117
+[TIMING] HTTP PUT tpcc.db: 38.9ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#118
+[TIMING] batch_multi: 601.9ms attempt=0 handles=556 completed=556/556 (reuse=116 new=2)
+[TIMING] xSync(db): total=617.6ms | resize=0.0ms coalesce=2.6ms write_batch=615.0ms | dirty_pages=585 ranges=556 bytes=2396160 reads_since_sync=323 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 22.8ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#119
+[TIMING] HTTP PUT tpcc.db-wal: 26.0ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#120
+[TIMING] HTTP PUT tpcc.db-wal: 492.6ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#121
+[TIMING] HTTP PUT tpcc.db-wal: 113.9ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#122
+[TIMING] HTTP DELETE tpcc.db-wal: 23.5ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#123
+[TIMING] HTTP PUT tpcc.db-wal: 24.1ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#124
+[TIMING] HTTP PUT tpcc.db-wal: 593.5ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#125
+[TIMING] HTTP PUT tpcc.db-wal: 88.8ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#126
+[TIMING] HTTP PUT tpcc.db: 52.9ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#127
+[TIMING] batch_multi: 472.5ms attempt=0 handles=526 completed=526/526 (reuse=125 new=2)
+[TIMING] xSync(db): total=497.7ms | resize=0.0ms coalesce=2.8ms write_batch=494.9ms | dirty_pages=566 ranges=526 bytes=2318336 reads_since_sync=304 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 23.4ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#128
+[TIMING] HTTP PUT tpcc.db-wal: 24.5ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#129
+[TIMING] HTTP PUT tpcc.db-wal: 525.0ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#130
+[TIMING] HTTP PUT tpcc.db-wal: 91.0ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#131
+[TIMING] HTTP DELETE tpcc.db-wal: 23.6ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#132
+[TIMING] HTTP PUT tpcc.db-wal: 43.4ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#133
+[TIMING] HTTP PUT tpcc.db-wal: 558.5ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#134
+[TIMING] HTTP PUT tpcc.db-wal: 93.9ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#135
+[TIMING] HTTP PUT tpcc.db: 53.6ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#136
+[TIMING] batch_multi: 471.4ms attempt=0 handles=521 completed=521/521 (reuse=134 new=2)
+[TIMING] xSync(db): total=487.5ms | resize=0.0ms coalesce=3.5ms write_batch=484.0ms | dirty_pages=563 ranges=521 bytes=2306048 reads_since_sync=274 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 22.3ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#137
+[TIMING] HTTP PUT tpcc.db-wal: 22.7ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#138
+[TIMING] HTTP PUT tpcc.db-wal: 584.7ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#139
+[TIMING] HTTP PUT tpcc.db-wal: 90.1ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#140
+[TIMING] HTTP DELETE tpcc.db-wal: 24.2ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#141
+[TIMING] HTTP PUT tpcc.db-wal: 26.6ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#142
+[TIMING] HTTP PUT tpcc.db-wal: 610.0ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=4194304 req#143
+[TIMING] HTTP PUT tpcc.db-wal: 85.0ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=473688 req#144
+[TIMING] HTTP PUT tpcc.db: 20.7ms (dns=0.1ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#145
+[TIMING] batch_multi: 506.6ms attempt=0 handles=566 completed=566/566 (reuse=143 new=2)
+[TIMING] xSync(db): total=525.7ms | resize=0.0ms coalesce=2.8ms write_batch=522.9ms | dirty_pages=608 ranges=566 bytes=2490368 reads_since_sync=244 jrnl_reads=0
+[TIMING] HTTP DELETE tpcc.db-wal: 25.3ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#146
+[TIMING] HTTP PUT tpcc.db: 22.7ms (dns=0.0ms tcp=0.0ms tls=0.0ms REUSED) body=0 req#147
+[TIMING] lease_release: 22.8ms (blob=tpcc.db)

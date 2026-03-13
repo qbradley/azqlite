@@ -65,15 +65,19 @@ SQLITE_SRC  = $(SQLITE_DIR)/sqlite3.c
 SQLITE_OBJ  = $(BUILD_DIR)/sqlite3.o
 
 VFS_SRCS    = $(SRC_DIR)/azqlite_vfs.c \
+              $(SRC_DIR)/azqlite_cache.c \
               $(SRC_DIR)/azure_client_stub.c
 VFS_OBJS    = $(BUILD_DIR)/azqlite_vfs.o \
+              $(BUILD_DIR)/azqlite_cache.o \
               $(BUILD_DIR)/azure_client_stub.o
 
 PROD_SRCS   = $(SRC_DIR)/azqlite_vfs.c \
+              $(SRC_DIR)/azqlite_cache.c \
               $(SRC_DIR)/azure_client.c \
               $(SRC_DIR)/azure_auth.c \
               $(SRC_DIR)/azure_error.c
 PROD_OBJS   = $(BUILD_DIR)/azqlite_vfs.o \
+              $(BUILD_DIR)/azqlite_cache.o \
               $(BUILD_DIR)/azure_client.o \
               $(BUILD_DIR)/azure_auth.o \
               $(BUILD_DIR)/azure_error.o
@@ -87,9 +91,9 @@ PROD_LIBRARY   = $(BUILD_DIR)/libazqlite.a
 SHELL_SRC   = $(SRC_DIR)/azqlite_shell.c
 SHELL_BIN   = azqlite-shell
 
-# Test objects — tests link against mock + stub + auth + error modules
+# Test objects — tests link against mock + stub + auth + error + cache modules
 MOCK_OBJ    = $(BUILD_DIR)/mock_azure_ops.o
-TEST_OBJS   = $(SQLITE_OBJ) $(BUILD_DIR)/azqlite_vfs.o $(BUILD_DIR)/azure_client_stub.o $(MOCK_OBJ) \
+TEST_OBJS   = $(SQLITE_OBJ) $(BUILD_DIR)/azqlite_vfs.o $(BUILD_DIR)/azqlite_cache.o $(BUILD_DIR)/azure_client_stub.o $(MOCK_OBJ) \
               $(BUILD_DIR)/azure_auth.o $(BUILD_DIR)/azure_error.o
 
 # ---------- Default target ----------
@@ -111,7 +115,10 @@ $(SQLITE_OBJ): $(SQLITE_SRC) | $(BUILD_DIR)
 
 # ---------- VFS sources ----------
 
-$(BUILD_DIR)/azqlite_vfs.o: $(SRC_DIR)/azqlite_vfs.c $(SRC_DIR)/azqlite.h $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
+$(BUILD_DIR)/azqlite_vfs.o: $(SRC_DIR)/azqlite_vfs.c $(SRC_DIR)/azqlite.h $(SRC_DIR)/azure_client.h $(SRC_DIR)/azqlite_cache.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/azqlite_cache.o: $(SRC_DIR)/azqlite_cache.c $(SRC_DIR)/azqlite_cache.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/azure_client_stub.o: $(SRC_DIR)/azure_client_stub.c $(SRC_DIR)/azure_client.h | $(BUILD_DIR)
@@ -141,6 +148,7 @@ all-production: $(PROD_LIB_OBJS) $(SHELL_SRC) | $(BUILD_DIR)
 		-DSQLITE_THREADSAFE=1 \
 		-o $(SHELL_BIN) $(SRC_DIR)/azqlite_shell.c \
 		$(BUILD_DIR)/azqlite_vfs.o \
+		$(BUILD_DIR)/azqlite_cache.o \
 		$(BUILD_DIR)/azure_client.o \
 		$(BUILD_DIR)/azure_auth.o \
 		$(BUILD_DIR)/azure_error.o \
@@ -156,6 +164,7 @@ $(SHELL_BIN): $(SRC_DIR)/azqlite_shell.c $(LIBRARY)
 		-DSQLITE_THREADSAFE=1 \
 		-o $@ $(SRC_DIR)/azqlite_shell.c \
 		$(BUILD_DIR)/azqlite_vfs.o \
+		$(BUILD_DIR)/azqlite_cache.o \
 		$(BUILD_DIR)/azure_client_stub.o \
 		$(SQLITE_OBJ) \
 		$(LDFLAGS)

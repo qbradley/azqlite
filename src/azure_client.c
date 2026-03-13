@@ -169,6 +169,7 @@ static size_t curl_header_cb(char *buffer, size_t size, size_t nitems,
     CAPTURE_HEADER("x-ms-lease-status", 17, h->lease_status)
     CAPTURE_HEADER("x-ms-request-id",   15, h->request_id)
     CAPTURE_HEADER("x-ms-error-code",   15, h->error_code)
+    CAPTURE_HEADER("ETag",               4, h->etag)
 
     #undef CAPTURE_HEADER
 
@@ -611,6 +612,11 @@ static azure_err_t execute_with_retry(
 
         if (rc == AZURE_OK) {
             if (resp_headers) *resp_headers = rh;
+            /* Propagate ETag to error struct for VFS consumption */
+            if (rh.etag[0] && err) {
+                strncpy(err->etag, rh.etag, sizeof(err->etag) - 1);
+                err->etag[sizeof(err->etag) - 1] = '\0';
+            }
             return AZURE_OK;
         }
 

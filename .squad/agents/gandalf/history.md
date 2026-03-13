@@ -87,3 +87,16 @@ Completed comprehensive design review (D1-D11). Verdict: **APPROVE WITH CONDITIO
 - **Key observation:** The batch retry uses pure exponential backoff without jitter (unlike sequential path). Non-blocking but should be fixed for consistency before Phase 3.
 - **Missing test coverage:** No test for partial batch failure (some ranges succeed, others fail, then retry). Hard to test with current mock (batch=NULL). Tracked as Phase 3 follow-up.
 - **Full review at:** `.squad/decisions/inbox/gandalf-phase12-review.md`
+
+### Adaptive Readahead Design (2025-07-17)
+
+- **Produced complete design document:** `research/adaptive-readahead-design.md` — addresses D-4.4 (readahead not adaptive) and D-4.3 (getenv on every miss) from the demand paging design review.
+- **3-state machine:** INITIAL → SEQUENTIAL (window grows 4→1024 pages) or RANDOM (demand-only, window=1). Transitions based on whether cache misses follow the predicted sequential boundary.
+- **Key design choice: tolerance-based sequential detection.** Unlike Linux's exact-boundary match, azqlite allows a gap of `max(W/4, 4)` pages to handle pre-cached pages from xOpen prefetch. This is necessary because our prefetch populates arbitrary cache regions that Linux's page cache doesn't have.
+- **Key design choice: no async readahead.** Linux's main innovation (overlapping I/O via async markers) requires background I/O threads. Deferred to future xFetch/xUnfetch implementation. The synchronous state machine captures most benefit with minimal complexity.
+- **Configuration migrated from env vars to URI parameters:** `readahead=auto|N`, `readahead_max=N`, `cache_pages=N`. Per team directive, no environment variables.
+- **Performance projections:** Sequential scans 9–15× fewer HTTP GETs (fixed 64 → adaptive max 1024). Index lookups eliminate 98% of bandwidth waste. Mixed OLTP 1.5–2× improvement during warmup.
+- **Max window 1024 pages (4 MiB):** Chosen to balance HTTP latency amortisation (~95 MB/s effective throughput) against wasted bandwidth on false sequential detection. Tunable via `readahead_max` URI parameter.
+- **Interaction with 1GB default cache:** For databases <1GB, readahead is mostly irrelevant (everything cached after prefetch). For >1GB databases, adaptive readahead is the primary performance lever.
+- **Estimated 3 days to implement** across 4 phases: core state machine, config migration, observability, validation.
+- **Status:** PROPOSED — awaiting Brady's review before implementation.
