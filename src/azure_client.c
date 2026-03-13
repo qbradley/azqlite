@@ -476,8 +476,10 @@ static azure_err_t execute_single(
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, curl_header_cb);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, rh);
 
-    /* Timeouts */
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+    /* Timeouts — no hard wall-clock limit (CURLOPT_TIMEOUT) because large
+     * blob transfers (prefetch=all on 100MB+ DBs) legitimately take minutes.
+     * LOW_SPEED_LIMIT/TIME detects stalled connections: if transfer drops
+     * below 1KB/s for 30 seconds, curl aborts with CURLE_OPERATION_TIMEDOUT. */
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
@@ -1273,7 +1275,6 @@ static azure_err_t batch_init_easy(
     curl_easy_setopt(req->easy, CURLOPT_HEADERDATA, &req->resp_hdrs);
 
     /* Timeouts and keep-alive (match execute_single settings) */
-    curl_easy_setopt(req->easy, CURLOPT_TIMEOUT, 60L);
     curl_easy_setopt(req->easy, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(req->easy, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(req->easy, CURLOPT_LOW_SPEED_LIMIT, 1024L);
