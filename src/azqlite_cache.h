@@ -101,6 +101,13 @@ int azqlite_cache_etag_matches(azqlite_cache_t *cache, const char *remote_etag);
 */
 void azqlite_cache_invalidate_all(azqlite_cache_t *cache);
 
+/*
+** Invalidate pages above max_page_no (clear valid+dirty bits).
+** Called on xTruncate to discard pages beyond the new file size.
+** Pages 0..max_page_no are kept. If max_page_no < 0, all pages are invalidated.
+*/
+void azqlite_cache_invalidate_above(azqlite_cache_t *cache, int max_page_no);
+
 /* ===================================================================
 ** Page operations (all thread-safe via internal mutex)
 ** =================================================================== */

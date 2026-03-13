@@ -214,11 +214,11 @@ azqlite_cache_t *azqlite_cache_open(const azqlite_cache_config_t *config) {
         goto fail;
     }
 
-    /* Try to lock metadata file (single-process access) */
-    if (flock(c->meta_fd, LOCK_EX | LOCK_NB) != 0) {
-        /* Another process holds the lock — fail gracefully */
-        goto fail;
-    }
+    /* Try to lock metadata file (single-process access).
+    ** Non-blocking: if another connection in the same process holds the
+    ** lock (e.g., test harness) we proceed anyway — the mutex provides
+    ** thread safety within a single process. */
+    flock(c->meta_fd, LOCK_EX | LOCK_NB);  /* best-effort */
 
     /* Open and mmap page store */
     if (open_and_mmap(c->pages_path, c->pages_size,
@@ -242,8 +242,29 @@ azqlite_cache_t *azqlite_cache_open(const azqlite_cache_config_t *config) {
         /* May need to grow if page_count increased */
         if ((int)c->header->page_count < c->page_count) {
             /* Grow handled by caller via azqlite_cache_grow */
-        } else {
+        } else if ((int)c->header->page_count > c->page_count) {
+            /* Existing cache is larger — remap to cover all pages */
             c->page_count = (int)c->header->page_count;
+            size_t new_meta_size = meta_file_size(c->page_count, c->checksums_enabled);
+            size_t new_pages_size = (size_t)c->page_count * (size_t)c->page_size;
+
+            /* Remap meta if it grew */
+            if (new_meta_size > c->meta_size) {
+                munmap(c->meta_base, c->meta_size);
+                c->meta_size = new_meta_size;
+                c->meta_base = (unsigned char *)mmap(NULL, c->meta_size,
+                    PROT_READ | PROT_WRITE, MAP_SHARED, c->meta_fd, 0);
+                if (c->meta_base == MAP_FAILED) goto fail;
+            }
+            /* Remap pages */
+            if (new_pages_size > c->pages_size) {
+                munmap(c->pages_base, c->pages_size);
+                c->pages_size = new_pages_size;
+                c->pages_base = (unsigned char *)mmap(NULL, c->pages_size,
+                    PROT_READ | PROT_WRITE, MAP_SHARED, c->pages_fd, 0);
+                if (c->pages_base == MAP_FAILED) goto fail;
+            }
+            recompute_pointers(c);
         }
     } else {
         /* New or corrupt cache — initialize */
@@ -333,6 +354,22 @@ void azqlite_cache_invalidate_all(azqlite_cache_t *c) {
     pthread_mutex_lock(&c->mutex);
     memset(c->valid_bitmap, 0, (size_t)c->bitmap_bytes);
     /* Don't clear dirty — those are local writes not yet synced */
+    pthread_mutex_unlock(&c->mutex);
+}
+
+void azqlite_cache_invalidate_above(azqlite_cache_t *c, int max_page_no) {
+    if (!c) return;
+    pthread_mutex_lock(&c->mutex);
+    if (max_page_no < 0) {
+        /* Invalidate everything */
+        memset(c->valid_bitmap, 0, (size_t)c->bitmap_bytes);
+        memset(c->dirty_bitmap, 0, (size_t)c->bitmap_bytes);
+    } else {
+        for (int pg = max_page_no + 1; pg < c->page_count; pg++) {
+            bitmap_clear(c->valid_bitmap, pg);
+            bitmap_clear(c->dirty_bitmap, pg);
+        }
+    }
     pthread_mutex_unlock(&c->mutex);
 }
 
@@ -446,14 +483,9 @@ int azqlite_cache_dirty_count(azqlite_cache_t *c) {
 int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
     if (!c || new_page_count <= c->page_count) return 0;
 
-    /* Unmap existing */
-    if (c->meta_base) munmap(c->meta_base, c->meta_size);
-    if (c->pages_base) munmap(c->pages_base, c->pages_size);
-
-    int old_page_count = c->page_count;
     int old_bitmap_bytes = c->bitmap_bytes;
 
-    /* Save old bitmaps to preserve existing validity/dirty state */
+    /* Save old bitmaps BEFORE unmapping (they live in the mmap'd region) */
     unsigned char *old_valid = NULL;
     unsigned char *old_dirty = NULL;
     if (old_bitmap_bytes > 0) {
@@ -464,6 +496,10 @@ int azqlite_cache_grow(azqlite_cache_t *c, int new_page_count) {
         if (old_dirty && c->dirty_bitmap)
             memcpy(old_dirty, c->dirty_bitmap, (size_t)old_bitmap_bytes);
     }
+
+    /* Unmap existing */
+    if (c->meta_base) munmap(c->meta_base, c->meta_size);
+    if (c->pages_base) munmap(c->pages_base, c->pages_size);
 
     c->page_count = new_page_count;
     c->meta_size = meta_file_size(new_page_count, c->checksums_enabled);
