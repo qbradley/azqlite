@@ -122,6 +122,14 @@ typedef struct azure_page_range {
     size_t len;              /* Must be 512-byte aligned, max 4 MiB */
 } azure_page_range_t;
 
+/* A read request for batch reads */
+typedef struct azure_read_range {
+    int64_t offset;          /* Byte offset to read from */
+    size_t len;              /* Bytes to read */
+    uint8_t *data;           /* Output buffer (caller allocates) */
+    size_t data_len;         /* Actual bytes received */
+} azure_read_range_t;
+
 /* Maximum bytes per append_blob_append call (Azure limit) */
 #define AZURE_MAX_APPEND_SIZE (4 * 1024 * 1024)
 
@@ -233,6 +241,17 @@ struct azure_ops {
         void *ctx, const char *name,
         const azure_page_range_t *ranges, int nRanges,
         const char *lease_id, azure_error_t *err);
+
+    /* ---- Batch Read (parallel GET via curl_multi) ---- */
+
+    /* Read multiple page ranges in parallel.
+    ** NULL = VFS falls back to sequential page_blob_read().
+    ** Each read range has offset+len (input) and data buffer (output).
+    ** Returns AZURE_OK only if ALL reads succeed. */
+    azure_err_t (*page_blob_read_batch)(
+        void *ctx, const char *name,
+        azure_read_range_t *ranges, int nRanges,
+        azure_error_t *err);
 
     /* ---- Append Blob Operations (for WAL mode) ---- */
 

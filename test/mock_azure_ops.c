@@ -805,6 +805,28 @@ static azure_err_t mock_append_blob_delete_impl(void *vctx,
 
 /* ── The vtable singleton ─────────────────────────────────────────── */
 
+/* Batch read — iterate ranges and call mock_page_blob_read for each */
+static azure_err_t mock_page_blob_read_batch(
+    void *vctx, const char *name,
+    azure_read_range_t *ranges, int nRanges,
+    azure_error_t *err)
+{
+    for (int i = 0; i < nRanges; i++) {
+        azure_buffer_t buf = {0};
+        azure_err_t rc = mock_page_blob_read(vctx, name, ranges[i].offset,
+                                              ranges[i].len, &buf, err);
+        if (rc != AZURE_OK) {
+            azure_buffer_free(&buf);
+            return rc;
+        }
+        size_t to_copy = buf.size < ranges[i].len ? buf.size : ranges[i].len;
+        memcpy(ranges[i].data, buf.data, to_copy);
+        ranges[i].data_len = to_copy;
+        azure_buffer_free(&buf);
+    }
+    return AZURE_OK;
+}
+
 static azure_ops_t mock_ops = {
     .page_blob_create   = mock_page_blob_create,
     .page_blob_write    = mock_page_blob_write,
@@ -821,6 +843,8 @@ static azure_ops_t mock_ops = {
     .lease_break        = mock_lease_break_impl,
     /* Batch write — not implemented in mock (Phase 2) */
     .page_blob_write_batch = NULL,
+    /* Batch read — sequential fallback via mock_page_blob_read */
+    .page_blob_read_batch = mock_page_blob_read_batch,
     /* Append blob — WAL mode */
     .append_blob_create = mock_append_blob_create_impl,
     .append_blob_append = mock_append_blob_append_impl,
