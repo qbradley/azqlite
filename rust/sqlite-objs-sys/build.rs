@@ -3,14 +3,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    let repo_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-
-    let src_dir = repo_root.join("src");
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let src_dir = manifest_dir.join("csrc");
 
     // Get SQLite include path from libsqlite3-sys (set via its `links` metadata)
     let sqlite_include = env::var("DEP_SQLITE3_INCLUDE")

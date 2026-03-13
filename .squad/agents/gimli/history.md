@@ -88,3 +88,24 @@ All tests pass (5 total):
 `cargo build` compiles ~50 crates in ~4s (release: TBD)
 `cargo test` all passing in <1s (FFI only, no I/O)
 
+### Cargo Publish Fix — Bundled C Sources (2025-03-13)
+
+**Problem:** `cargo publish --dry-run` failed because `build.rs` navigated to `../../src/` relative
+to `CARGO_MANIFEST_DIR` to find C sources. When cargo packages for publish, it extracts to a temp
+directory (`rust/target/package/sqlite-objs-sys-0.1.0-alpha/`) where `../../src/` doesn't exist.
+
+**Solution:** Created `rust/sqlite-objs-sys/csrc/` directory and copied all needed C source and
+header files there (7 files total: 4 `.c`, 3 `.h`). Updated `build.rs` to use
+`CARGO_MANIFEST_DIR/csrc/` instead of navigating to repo root.
+
+**Files bundled in csrc/:**
+- `sqlite_objs_vfs.c`, `azure_client.c`, `azure_auth.c`, `azure_error.c`
+- `sqlite_objs.h`, `azure_client.h`, `azure_client_impl.h`
+
+**Pattern:** Any `-sys` crate that compiles C code must bundle its sources inside the crate
+directory — relative paths outside the crate break during `cargo publish` verification. The `cc`
+crate's `file()` and `include()` calls should only reference paths within `CARGO_MANIFEST_DIR`.
+
+**Verification:** `cargo publish --dry-run -p sqlite-objs-sys --allow-dirty` succeeds. All 8 Rust
+tests + 3 doc-tests pass. All 242 C unit tests pass. Makefile build unaffected.
+
