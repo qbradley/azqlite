@@ -771,7 +771,7 @@ TEST(integ_uri_two_containers) {
     sqlite3 *db1 = NULL;
     char uri1[512];
     snprintf(uri1, sizeof(uri1),
-        "file:crossc.db?"
+        "file:crossc1.db?"
         "azure_account=%s&azure_container=%s&azure_key=%s&azure_endpoint=%s",
         AZURITE_ACCOUNT, container1, AZURITE_KEY, AZURITE_ENDPOINT);
     rc = sqlite3_open_v2(uri1, &db1,
@@ -784,7 +784,7 @@ TEST(integ_uri_two_containers) {
     sqlite3 *db2 = NULL;
     char uri2[512];
     snprintf(uri2, sizeof(uri2),
-        "file:crossc.db?"
+        "file:crossc2.db?"
         "azure_account=%s&azure_container=%s&azure_key=%s&azure_endpoint=%s",
         AZURITE_ACCOUNT, container2, AZURITE_KEY, AZURITE_ENDPOINT);
     rc = sqlite3_open_v2(uri2, &db2,
