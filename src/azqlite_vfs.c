@@ -101,6 +101,7 @@ static int azqliteShmUnmap(sqlite3_file*, int);
 ** =================================================================== */
 
 #define AZQLITE_DEFAULT_CACHE_PAGES 262144  /* 1 GB at 4K page size */
+#define AZQLITE_DEFAULT_PREFETCH_PAGES 1024 /* 4 MB warmup at open */
 
 /* Page cache entry — one per cached page */
 typedef struct azqlite_cache_entry {
@@ -467,6 +468,7 @@ typedef struct azqliteFile {
     int readaheadMode;       /* 0=auto (adaptive), >0=fixed N pages */
     int readaheadMaxWindow;  /* Max window for adaptive mode */
     int cachePagesConfig;    /* Configured max cache pages */
+    int prefetchPages;       /* Pages to fetch at open (warmup) */
 } azqliteFile;
 
 /*
@@ -1948,6 +1950,7 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     p->readaheadMode = 0;              /* adaptive by default */
     p->readaheadMaxWindow = RA_MAX_WINDOW;
     p->cachePagesConfig = AZQLITE_DEFAULT_CACHE_PAGES;
+    p->prefetchPages = AZQLITE_DEFAULT_PREFETCH_PAGES;
 
     /* Parse readahead URI parameters */
     const char *raParam = sqlite3_uri_parameter(zName, "readahead");
@@ -1968,6 +1971,11 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     if (cpParam) {
         int val = atoi(cpParam);
         if (val > 0) p->cachePagesConfig = val;
+    }
+    const char *pfParam = sqlite3_uri_parameter(zName, "prefetch");
+    if (pfParam) {
+        int val = atoi(pfParam);
+        if (val >= 0) p->prefetchPages = val;
     }
 
     if (isMainDb) {
@@ -2012,12 +2020,13 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
             p->blobSize = blobSize;
 
             if (blobSize > 0 && p->ops->page_blob_read) {
-                /* Fetch first page to detect page size from SQLite header */
-            /* Prefetch: fill cache at open to avoid cold-cache HTTP storms.
-             * For small DBs (fit in cache), this loads the entire DB.
-             * For large DBs, it pre-warms with the first maxPages pages. */
-            int maxPages = p->cachePagesConfig;
-            size_t maxPrefetch = (size_t)maxPages * AZQLITE_DEFAULT_PAGE_SIZE;
+            /* Prefetch: warm cache at open with a bounded number of pages.
+             * The adaptive readahead state machine handles demand fetching
+             * beyond this initial warmup. Cap at cache size to avoid waste. */
+            int prefetchLimit = p->prefetchPages;
+            if (prefetchLimit > p->cachePagesConfig)
+                prefetchLimit = p->cachePagesConfig;
+            size_t maxPrefetch = (size_t)prefetchLimit * AZQLITE_DEFAULT_PAGE_SIZE;
             size_t fetchLen = ((int64_t)maxPrefetch <= blobSize)
                               ? maxPrefetch : (size_t)blobSize;
             if (fetchLen < AZQLITE_DEFAULT_PAGE_SIZE && blobSize > 0)
