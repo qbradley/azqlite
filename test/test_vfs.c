@@ -3468,6 +3468,124 @@ TEST(cross_vfs_local_and_azure_join) {
     unlink("cross_local.db");
 }
 
+/* ===================================================================
+** Background Prefetch Thread Tests
+** =================================================================== */
+
+#define TEST_FCNTL_PREFETCH_STATUS 1002
+#define TEST_FCNTL_PREFETCH_WAIT   1003
+
+typedef struct {
+    int running;
+    int progress;
+    int total;
+} test_prefetch_status_t;
+
+/*
+** prefetch_thread_fills_cache: Create a multi-page DB, open with prefetch,
+** wait for completion, verify all pages cached (0 Azure reads on query).
+*/
+TEST(prefetch_thread_fills_cache) {
+    setup();
+
+    /* Create a real database with enough data to span many pages */
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    int rc;
+    rc = sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT);",
+                       NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    for (int i = 0; i < 500; i++) {
+        char sql[512];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES(%d, '%0300d');", i, i);
+        rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+        ASSERT_OK(rc);
+    }
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    close_test_db(db);
+
+    /* Clean cache so next open must refetch */
+    clean_test_cache_dir();
+
+    /* Reopen — this triggers synchronous prefetch + background thread */
+    db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    /* Wait for background prefetch to complete */
+    rc = sqlite3_file_control(db, "main", TEST_FCNTL_PREFETCH_WAIT, NULL);
+    ASSERT_OK(rc);
+
+    /* Check status — thread should be done */
+    test_prefetch_status_t status;
+    memset(&status, 0, sizeof(status));
+    rc = sqlite3_file_control(db, "main", TEST_FCNTL_PREFETCH_STATUS, &status);
+    ASSERT_OK(rc);
+    ASSERT_EQ(status.running, 0);
+
+    /* Reset counters and query — should be fully cached, zero Azure reads */
+    mock_reset_call_counts(g_ctx);
+
+    sqlite3_stmt *stmt;
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    ASSERT_OK(rc);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 500);
+    sqlite3_finalize(stmt);
+
+    /* No page_blob_read calls — everything served from cache */
+    ASSERT_EQ(mock_get_call_count(g_ctx, "page_blob_read"), 0);
+
+    close_test_db(db);
+}
+
+/*
+** prefetch_thread_cancel_on_close: Open with prefetch, immediately close
+** — should not crash or hang.
+*/
+TEST(prefetch_thread_cancel_on_close) {
+    setup();
+
+    /* Create a database with some data */
+    sqlite3 *db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+
+    int rc;
+    rc = sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT);",
+                       NULL, NULL, NULL);
+    ASSERT_OK(rc);
+
+    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    for (int i = 0; i < 200; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t VALUES(%d, '%0200d');", i, i);
+        rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+        ASSERT_OK(rc);
+    }
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ASSERT_OK(rc);
+    close_test_db(db);
+
+    /* Clean cache */
+    clean_test_cache_dir();
+
+    /* Reopen (triggers prefetch thread) and immediately close */
+    db = open_test_db(g_ctx);
+    ASSERT_NOT_NULL(db);
+    close_test_db(db);
+
+    /* If we get here without crash/hang, the test passes */
+    ASSERT_EQ(1, 1);
+}
+
 #endif /* ENABLE_VFS_INTEGRATION */
 
 void run_vfs_tests(void) {
@@ -3743,6 +3861,11 @@ void run_vfs_tests(void) {
 
     TEST_SUITE_BEGIN("Cross-VFS Operations");
     RUN_TEST(cross_vfs_local_and_azure_join);
+    TEST_SUITE_END();
+
+    TEST_SUITE_BEGIN("Background Prefetch Thread");
+    RUN_TEST(prefetch_thread_fills_cache);
+    RUN_TEST(prefetch_thread_cancel_on_close);
     TEST_SUITE_END();
 #endif
 

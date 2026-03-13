@@ -149,8 +149,17 @@ typedef struct azqlite_readahead_stats {
     int peakWindow;       /* High-water mark */
 } azqlite_readahead_stats_t;
 
-#define AZQLITE_FCNTL_READAHEAD_MODE  1000
-#define AZQLITE_FCNTL_READAHEAD_STATS 1001
+#define AZQLITE_FCNTL_READAHEAD_MODE    1000
+#define AZQLITE_FCNTL_READAHEAD_STATS   1001
+#define AZQLITE_FCNTL_PREFETCH_STATUS   1002
+#define AZQLITE_FCNTL_PREFETCH_WAIT     1003
+
+/* Prefetch status — returned via FCNTL */
+typedef struct azqlite_prefetch_status {
+    int running;      /* 1 if prefetch thread is active */
+    int progress;     /* Pages fetched so far */
+    int total;        /* Total pages to fetch */
+} azqlite_prefetch_status_t;
 
 /*
 ** Determine readahead window for a cache miss at page P.
@@ -314,6 +323,14 @@ typedef struct azqliteFile {
     int readaheadMaxWindow;  /* Max window for adaptive mode */
     int cachePagesConfig;    /* Configured max cache pages */
     int prefetchPages;       /* Pages to fetch at open (warmup) */
+
+    /* Background prefetch thread */
+    pthread_t prefetchThread;        /* Thread handle */
+    int prefetchRunning;             /* 1 = thread is alive */
+    int prefetchCancel;              /* 1 = request cancellation */
+    int prefetchProgress;            /* Pages fetched so far */
+    int prefetchTotal;               /* Total pages to fetch */
+    pthread_mutex_t prefetchMutex;   /* Protects progress/cancel */
 } azqliteFile;
 
 /*
@@ -544,6 +561,147 @@ static int detectPageSize(const unsigned char *aData, sqlite3_int64 nData) {
 
 
 /* ===================================================================
+** Background prefetch thread
+** =================================================================== */
+
+#define PREFETCH_BATCH_PAGES 64
+
+static void *prefetchThreadFunc(void *arg) {
+    azqliteFile *p = (azqliteFile *)arg;
+    int pageSize = p->pageSize;
+    int totalPages = (int)(p->blobSize / pageSize);
+    if (p->blobSize % pageSize != 0) totalPages++;
+
+    pthread_mutex_lock(&p->prefetchMutex);
+    p->prefetchTotal = totalPages;
+    pthread_mutex_unlock(&p->prefetchMutex);
+
+    int fetched = 0;
+    int pageNo = 0;
+
+    while (pageNo < totalPages) {
+        /* Check cancellation */
+        pthread_mutex_lock(&p->prefetchMutex);
+        int cancel = p->prefetchCancel;
+        pthread_mutex_unlock(&p->prefetchMutex);
+        if (cancel) break;
+
+        /* Collect a batch of invalid pages */
+        int batchPages[PREFETCH_BATCH_PAGES];
+        int batchCount = 0;
+        while (pageNo < totalPages && batchCount < PREFETCH_BATCH_PAGES) {
+            if (!azqlite_cache_page_valid(p->diskCache, pageNo)) {
+                batchPages[batchCount++] = pageNo;
+            }
+            pageNo++;
+        }
+        if (batchCount == 0) continue;
+
+        /* Try batch read if available */
+        if (p->ops->page_blob_read_batch) {
+            azure_read_range_t ranges[PREFETCH_BATCH_PAGES];
+            uint8_t *buffers[PREFETCH_BATCH_PAGES];
+            for (int i = 0; i < batchCount; i++) {
+                buffers[i] = malloc((size_t)pageSize);
+                if (!buffers[i]) {
+                    for (int j = 0; j < i; j++) free(buffers[j]);
+                    goto done;
+                }
+                ranges[i].offset = (int64_t)batchPages[i] * pageSize;
+                ranges[i].len = (size_t)pageSize;
+                /* Clamp last page to blob boundary */
+                if (ranges[i].offset + (int64_t)ranges[i].len > p->blobSize) {
+                    ranges[i].len = (size_t)(p->blobSize - ranges[i].offset);
+                }
+                ranges[i].data = buffers[i];
+                ranges[i].data_len = 0;
+            }
+
+            azure_error_t aerr;
+            azure_error_init(&aerr);
+            azure_err_t rc = p->ops->page_blob_read_batch(
+                p->ops_ctx, p->zBlobName, ranges, batchCount, &aerr);
+
+            if (rc == AZURE_OK) {
+                for (int i = 0; i < batchCount; i++) {
+                    /* Zero-pad short reads (partial last page) */
+                    if (ranges[i].data_len < (size_t)pageSize) {
+                        memset(buffers[i] + ranges[i].data_len, 0,
+                               (size_t)pageSize - ranges[i].data_len);
+                    }
+                    if (batchPages[i] >= azqlite_cache_page_count(p->diskCache)) {
+                        azqlite_cache_grow(p->diskCache, batchPages[i] + 64);
+                    }
+                    azqlite_cache_page_write_if_invalid(p->diskCache,
+                                                         batchPages[i], buffers[i]);
+                    fetched++;
+                }
+            }
+            for (int i = 0; i < batchCount; i++) free(buffers[i]);
+        } else {
+            /* Fallback: sequential reads via page_blob_read */
+            int firstPage = batchPages[0];
+            int lastPage = batchPages[batchCount - 1];
+            int64_t startOff = (int64_t)firstPage * pageSize;
+            int64_t endOff = (int64_t)(lastPage + 1) * pageSize;
+            if (endOff > p->blobSize) endOff = p->blobSize;
+            size_t readLen = (size_t)(endOff - startOff);
+
+            azure_buffer_t buf = {0};
+            azure_error_t aerr;
+            azure_error_init(&aerr);
+            azure_err_t rc = p->ops->page_blob_read(
+                p->ops_ctx, p->zBlobName, startOff, readLen, &buf, &aerr);
+
+            if (rc == AZURE_OK && buf.data) {
+                for (int i = 0; i < batchCount; i++) {
+                    int pg = batchPages[i];
+                    size_t off = (size_t)((int64_t)pg * pageSize - startOff);
+                    if (off + (size_t)pageSize <= buf.size) {
+                        if (pg >= azqlite_cache_page_count(p->diskCache)) {
+                            azqlite_cache_grow(p->diskCache, pg + 64);
+                        }
+                        azqlite_cache_page_write_if_invalid(p->diskCache,
+                                                             pg, buf.data + off);
+                        fetched++;
+                    } else if (off < buf.size) {
+                        /* Partial last page — zero-pad */
+                        unsigned char padded[65536];
+                        size_t avail = buf.size - off;
+                        memcpy(padded, buf.data + off, avail);
+                        memset(padded + avail, 0, (size_t)pageSize - avail);
+                        if (pg >= azqlite_cache_page_count(p->diskCache)) {
+                            azqlite_cache_grow(p->diskCache, pg + 64);
+                        }
+                        azqlite_cache_page_write_if_invalid(p->diskCache,
+                                                             pg, padded);
+                        fetched++;
+                    }
+                }
+            }
+            free(buf.data);
+        }
+
+        /* Update progress */
+        pthread_mutex_lock(&p->prefetchMutex);
+        p->prefetchProgress = fetched;
+        pthread_mutex_unlock(&p->prefetchMutex);
+    }
+
+done:
+    pthread_mutex_lock(&p->prefetchMutex);
+    p->prefetchProgress = fetched;
+    p->prefetchRunning = 0;
+    pthread_mutex_unlock(&p->prefetchMutex);
+
+    if (azqlite_debug_timing()) {
+        fprintf(stderr, "[PREFETCH-BG] done: fetched=%d/%d pages\n",
+                fetched, totalPages);
+    }
+    return NULL;
+}
+
+/* ===================================================================
 ** sqlite3_io_methods implementation
 ** =================================================================== */
 
@@ -553,6 +711,16 @@ static int detectPageSize(const unsigned char *aData, sqlite3_int64 nData) {
 static int azqliteClose(sqlite3_file *pFile) {
     azqliteFile *p = (azqliteFile *)pFile;
     int rc = SQLITE_OK;
+
+    /* Cancel and join background prefetch thread if running */
+    if (p->prefetchRunning) {
+        pthread_mutex_lock(&p->prefetchMutex);
+        p->prefetchCancel = 1;
+        pthread_mutex_unlock(&p->prefetchMutex);
+        pthread_join(p->prefetchThread, NULL);
+        p->prefetchRunning = 0;
+    }
+    pthread_mutex_destroy(&p->prefetchMutex);
 
     /* Flush any remaining dirty data before closing */
     if (p->diskCache && azqlite_cache_dirty_count(p->diskCache) > 0 &&
@@ -1582,6 +1750,24 @@ static int azqliteFileControl(sqlite3_file *pFile, int op, void *pArg) {
             s->peakWindow = p->readahead.peakWindow;
             return SQLITE_OK;
         }
+        case AZQLITE_FCNTL_PREFETCH_STATUS: {
+            azqliteFile *p = (azqliteFile *)pFile;
+            azqlite_prefetch_status_t *s = (azqlite_prefetch_status_t *)pArg;
+            pthread_mutex_lock(&p->prefetchMutex);
+            s->running = p->prefetchRunning;
+            s->progress = p->prefetchProgress;
+            s->total = p->prefetchTotal;
+            pthread_mutex_unlock(&p->prefetchMutex);
+            return SQLITE_OK;
+        }
+        case AZQLITE_FCNTL_PREFETCH_WAIT: {
+            azqliteFile *p = (azqliteFile *)pFile;
+            if (p->prefetchRunning) {
+                pthread_join(p->prefetchThread, NULL);
+                p->prefetchRunning = 0;
+            }
+            return SQLITE_OK;
+        }
         default:
             return SQLITE_NOTFOUND;
     }
@@ -1697,6 +1883,9 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
         return pVfsData->pDefaultVfs->xOpen(
             pVfsData->pDefaultVfs, zName, pFile, flags, pOutFlags);
     }
+
+    /* Initialize prefetch mutex for Azure-backed files */
+    pthread_mutex_init(&p->prefetchMutex, NULL);
 
     /* Azure-backed file */
     if (!zName || zName[0] == '\0') {
@@ -1974,6 +2163,28 @@ static int azqliteOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                             (long long)blobSize,
                             (double)blobSize / (1024.0 * 1024.0),
                             prefetch_ms);
+                }
+            }
+
+            /* Launch background prefetch thread for remaining pages */
+            if (blobSize > 0 && p->pageSize > 0 && p->ops->page_blob_read) {
+                int totalPages = (int)(blobSize / p->pageSize);
+                if (blobSize % p->pageSize != 0) totalPages++;
+                /* Count how many pages are still invalid */
+                int invalidCount = 0;
+                for (int i = 0; i < totalPages; i++) {
+                    if (!azqlite_cache_page_valid(p->diskCache, i))
+                        invalidCount++;
+                }
+                if (invalidCount > 0) {
+                    p->prefetchRunning = 1;
+                    p->prefetchCancel = 0;
+                    p->prefetchProgress = 0;
+                    p->prefetchTotal = totalPages;
+                    if (pthread_create(&p->prefetchThread, NULL,
+                                       prefetchThreadFunc, p) != 0) {
+                        p->prefetchRunning = 0;
+                    }
                 }
             }
 
