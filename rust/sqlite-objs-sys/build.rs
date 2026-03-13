@@ -10,18 +10,26 @@ fn main() {
     let sqlite_include = env::var("DEP_SQLITE3_INCLUDE")
         .expect("DEP_SQLITE3_INCLUDE should be set by libsqlite3-sys");
 
-    // Find OpenSSL on macOS using pkg-config or Homebrew
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    // Find OpenSSL using pkg-config; fall back to Homebrew on macOS only
     let openssl_include = if let Ok(output) = Command::new("pkg-config")
         .args(["--cflags-only-I", "openssl"])
         .output()
     {
-        String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .strip_prefix("-I")
-            .map(String::from)
-    } else if let Ok(output) = Command::new("brew").args(["--prefix", "openssl"]).output() {
-        let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Some(format!("{}/include", prefix))
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            s.strip_prefix("-I").map(String::from)
+        }
+    } else if target_os == "macos" {
+        if let Ok(output) = Command::new("brew").args(["--prefix", "openssl"]).output() {
+            let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Some(format!("{}/include", prefix))
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -38,10 +46,16 @@ fn main() {
         .define("SQLITE_THREADSAFE", "1")
         .define("SQLITE_ENABLE_FTS5", None)
         .define("SQLITE_ENABLE_JSON1", None)
-        .define("_DARWIN_C_SOURCE", None)
         .warnings(true)
         .extra_warnings(true)
         .flag("-std=c11");
+
+    // Platform-specific feature macros (mirrors Makefile logic)
+    if target_os == "macos" {
+        builder.define("_DARWIN_C_SOURCE", None);
+    } else {
+        builder.define("_GNU_SOURCE", None);
+    }
 
     if let Some(inc) = openssl_include {
         builder.include(inc);
@@ -49,7 +63,7 @@ fn main() {
 
     builder.compile("sqlite_objs");
 
-    // Find and link OpenSSL using pkg-config or Homebrew
+    // Find and link OpenSSL using pkg-config; fall back to Homebrew on macOS
     if let Ok(output) = Command::new("pkg-config")
         .args(["--libs-only-L", "openssl"])
         .output()
@@ -60,9 +74,11 @@ fn main() {
                 println!("cargo:rustc-link-search=native={}", path);
             }
         }
-    } else if let Ok(output) = Command::new("brew").args(["--prefix", "openssl"]).output() {
-        let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        println!("cargo:rustc-link-search=native={}/lib", prefix);
+    } else if target_os == "macos" {
+        if let Ok(output) = Command::new("brew").args(["--prefix", "openssl"]).output() {
+            let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            println!("cargo:rustc-link-search=native={}/lib", prefix);
+        }
     }
 
     // Link sqlite3 from libsqlite3-sys (needed for sqlite-objs C code's sqlite3_* calls)
@@ -77,6 +93,9 @@ fn main() {
     println!("cargo:rustc-link-lib=crypto");
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=m");
+    if target_os == "linux" {
+        println!("cargo:rustc-link-lib=dl");
+    }
 
     // Tell cargo to recompile if C sources change
     println!("cargo:rerun-if-changed={}", src_dir.join("sqlite_objs_vfs.c").display());

@@ -109,3 +109,28 @@ crate's `file()` and `include()` calls should only reference paths within `CARGO
 **Verification:** `cargo publish --dry-run -p sqlite-objs-sys --allow-dirty` succeeds. All 8 Rust
 tests + 3 doc-tests pass. All 242 C unit tests pass. Makefile build unaffected.
 
+### Linux Cross-Platform Portability Fix (2025-07-25)
+
+**Problem:** `sqlite-objs-sys` crate failed to compile on Linux (x86_64-unknown-linux-gnu). Two root
+causes: (1) `build.rs` defined `_DARWIN_C_SOURCE` unconditionally — a macOS-only macro that doesn't
+expose POSIX functions on Linux (`strncasecmp`, `strcasecmp`, `gmtime_r`, `strtok_r`, `usleep`,
+`useconds_t`). (2) OpenSSL detection fell back to `brew` on Linux where Homebrew doesn't exist.
+
+**Fix — build.rs (3 changes):**
+1. Platform-conditional feature macros via `CARGO_CFG_TARGET_OS`: define `_DARWIN_C_SOURCE` on macOS,
+   `_GNU_SOURCE` on everything else (covers all POSIX + GNU extensions including deprecated `usleep`).
+2. Homebrew fallback gated behind `target_os == "macos"` — Linux uses pkg-config only.
+3. Link `libdl` on Linux (matches Makefile's `-ldl` flag for dynamic loading).
+
+**Fix — C source files (both src/ and csrc/):**
+- Added `#include <strings.h>` to `azure_client.c` and `azure_auth.c`. This is the proper POSIX
+  header for `strcasecmp`/`strncasecmp` and works on both macOS and Linux regardless of feature macros.
+
+**Key insight:** The Makefile already had correct platform detection (`_DARWIN_C_SOURCE` on Darwin,
+`_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE` on Linux). The build.rs just needed to mirror this.
+Used `_GNU_SOURCE` instead of the Makefile's more conservative pair because it's a strict superset
+and simpler for a single define.
+
+**Verification:** macOS cargo build ✓, cargo test (5 unit + 3 doc-tests) ✓, Makefile build ✓,
+242 C unit tests ✓, cargo publish --dry-run ✓, csrc/ files match src/ ✓.
+
