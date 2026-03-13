@@ -796,6 +796,7 @@ TEST(integ_uri_two_containers) {
     /* Insert different data */
     char *errmsg = NULL;
     rc = sqlite3_exec(db1,
+        "DROP TABLE IF EXISTS t;"
         "CREATE TABLE t (id INTEGER, val TEXT);"
         "INSERT INTO t VALUES (1, 'container_one');",
         NULL, NULL, &errmsg);
@@ -806,6 +807,7 @@ TEST(integ_uri_two_containers) {
     ASSERT_OK(rc);
 
     rc = sqlite3_exec(db2,
+        "DROP TABLE IF EXISTS t;"
         "CREATE TABLE t (id INTEGER, val TEXT);"
         "INSERT INTO t VALUES (1, 'container_two');",
         NULL, NULL, &errmsg);
