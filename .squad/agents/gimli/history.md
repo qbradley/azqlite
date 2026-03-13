@@ -134,3 +134,30 @@ and simpler for a single define.
 **Verification:** macOS cargo build ✓, cargo test (5 unit + 3 doc-tests) ✓, Makefile build ✓,
 242 C unit tests ✓, cargo publish --dry-run ✓, csrc/ files match src/ ✓.
 
+### Docker-Based Linux Build Verification (2025-07)
+
+**Created:** `rust/docker-test/` — containerized smoke tests for Linux compilation.
+
+**Architecture:**
+- `Dockerfile.ubuntu24` — Ubuntu 24.04 with apt-get (primary Linux target)
+- `Dockerfile.azurelinux3` — Azure Linux 3 with tdnf (Microsoft's distro)
+- `sample-project/` — minimal Cargo project that depends on sqlite-objs via path
+- `test.sh` — orchestrator that builds images & runs containers with `rust/` mounted read-only
+
+**Key design decisions:**
+1. Build + test runs at `docker run` time (not `docker build`) because the rust/ crate source is
+   a read-only bind mount at `/rust-crates/`. This means no caching of Cargo builds across runs,
+   but guarantees a clean-room test every time.
+2. `[patch.crates-io]` in sample Cargo.toml overrides sqlite-objs-sys so Cargo resolves the
+   workspace path dependency chain correctly when building from outside the workspace.
+3. macOS containers are infeasible (Apple licensing) — noted in test.sh as a skip.
+
+**Learnings:**
+- When referencing a workspace crate via path from an external project, Cargo follows the workspace
+  root to resolve transitive workspace dependencies. The `[patch.crates-io]` belt-and-suspenders
+  approach ensures it works even if Cargo's workspace cross-boundary resolution has edge cases.
+- Azure Linux 3 uses `tdnf` (not dnf/yum) and package names like `curl-devel`/`openssl-devel`
+  (Fedora-style, not Debian-style).
+- Docker not available on the current dev machine — files verified via rustfmt + bash syntax check.
+  Actual container tests need Docker Desktop or a CI runner.
+

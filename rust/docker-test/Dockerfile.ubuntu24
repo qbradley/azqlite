@@ -1,0 +1,34 @@
+# --------------------------------------------------------------------------
+# sqlite-objs Linux build verification — Ubuntu 24.04
+# --------------------------------------------------------------------------
+# Usage (from repo root):
+#   docker build -f rust/docker-test/Dockerfile.ubuntu24 \
+#                -t sqlite-objs-test-ubuntu24 rust/docker-test/
+#   docker run --rm -v $(pwd)/rust:/rust-crates:ro sqlite-objs-test-ubuntu24
+# --------------------------------------------------------------------------
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Build toolchain + libraries required by sqlite-objs-sys build.rs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        curl \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust toolchain (stable, minimal profile — we only need cargo + rustc)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Copy the sample project (small — just Cargo.toml + main.rs)
+COPY sample-project/ /app/
+WORKDIR /app
+
+# The actual build + test runs at container start because /rust-crates/
+# is a read-only bind mount supplied at `docker run` time.
+CMD ["sh", "-c", "cargo build 2>&1 && ./target/debug/docker-smoke-test"]

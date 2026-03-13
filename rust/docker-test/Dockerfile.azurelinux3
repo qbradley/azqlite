@@ -1,0 +1,32 @@
+# --------------------------------------------------------------------------
+# sqlite-objs Linux build verification — Azure Linux 3 (CBL-Mariner 3)
+# --------------------------------------------------------------------------
+# Usage (from repo root):
+#   docker build -f rust/docker-test/Dockerfile.azurelinux3 \
+#                -t sqlite-objs-test-azurelinux3 rust/docker-test/
+#   docker run --rm -v $(pwd)/rust:/rust-crates:ro sqlite-objs-test-azurelinux3
+# --------------------------------------------------------------------------
+FROM mcr.microsoft.com/azurelinux/base/core:3.0
+
+# Build toolchain + libraries required by sqlite-objs-sys build.rs
+# Azure Linux uses tdnf (a dnf-compatible package manager).
+# build-essential pulls in gcc, binutils, glibc-devel, kernel-headers, make, etc.
+RUN tdnf install -y \
+        build-essential \
+        pkg-config \
+        curl-devel \
+        openssl-devel \
+        ca-certificates \
+    && tdnf clean all
+
+# Rust toolchain (stable, minimal profile)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Copy the sample project
+COPY sample-project/ /app/
+WORKDIR /app
+
+# Build + test at runtime (needs /rust-crates/ bind mount)
+CMD ["sh", "-c", "cargo build 2>&1 && ./target/debug/docker-smoke-test"]

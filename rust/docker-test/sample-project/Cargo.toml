@@ -1,0 +1,15 @@
+[package]
+name = "docker-smoke-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sqlite-objs = { path = "/rust-crates/sqlite-objs" }
+rusqlite = "0.38"
+
+# Override workspace path deps so Cargo resolves them from the mount.
+# sqlite-objs depends on sqlite-objs-sys via its workspace, and that
+# workspace entry carries a version field. The patch ensures Cargo uses
+# the local path even when resolving from outside the workspace.
+[patch.crates-io]
+sqlite-objs-sys = { path = "/rust-crates/sqlite-objs-sys" }
