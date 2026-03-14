@@ -203,3 +203,48 @@ let uri = UriBuilder::new("mydb.db", "myaccount", "databases")
 **Impact:** Eliminates common URI encoding errors for Rust users. Builder API is more ergonomic than manual string concatenation. Zero external dependencies added.
 
 
+
+### Multi-Threading Test Suite (2025-07)
+
+**Added:** Comprehensive multi-threading tests in `rust/sqlite-objs/tests/threading.rs` to verify
+thread safety after discovering a C-level thread-safety bug (shared curl handle across connections).
+
+**Key Finding — rusqlite::Connection Thread Safety:**
+- `Connection` is **Send** (can be moved between threads) ✓
+- `Connection` is **NOT Sync** (cannot be shared via Arc) ✗
+- Root cause: `Connection` contains `RefCell` (interior mutability, not thread-safe)
+- Best practice: Each thread creates its own `Connection` to the same database file
+
+**Test Coverage (5 tests, all passing):**
+
+1. **test_two_threads_separate_databases** — Two threads, separate DB files, parallel work with
+   barrier synchronization. Verifies Connection is Send and VFS registration is thread-safe.
+
+2. **test_multiple_threads_mutex_sequential** — Arc<Mutex<Connection>> pattern (not recommended
+   but technically valid). 4 threads sequentially increment a shared counter. Verifies mutex
+   serialization works correctly.
+
+3. **test_multiple_threads_separate_connections** — **Recommended pattern.** 5 threads, each with
+   its own Connection to the same DB file. Each creates a unique table and writes to a shared
+   table. SQLite's file locking handles concurrent access. Barrier ensures parallel stress.
+
+4. **test_stress_many_threads** — 10 threads × 5 iterations = 50 concurrent inserts. Verifies no
+   crashes or data corruption under load. Each thread verifies its own row count incrementally.
+
+5. **test_connection_send_trait** — Explicit Send trait test. Creates Connection in main thread,
+   moves to worker thread, performs work, moves back to main. Verifies ownership transfer semantics.
+
+**Design Notes:**
+- All tests use local file paths (tempfile crate), not Azure URIs — VFS independence testing
+- Tests do NOT require Azure credentials or Azurite — pure SQLite threading semantics
+- Barrier synchronization ensures true parallelism (not just concurrent, but simultaneous)
+- No new dependencies (rusqlite and tempfile already in dev-dependencies)
+
+**Verification:** 27 total tests pass (16 unit + 3 ignored Azure + 5 threading + 2 sys + 4 doc).
+Threading tests complete in ~0.1s. No test failures, no flaky behavior across multiple runs.
+
+**Impact:** Provides regression coverage for the C-level mutex fix to `azure_client_t`. If the C
+code regresses to a shared curl handle without locking, these tests won't directly catch it (they
+don't use Azure), but they establish the threading contract expected by Rust users. Future Azure
+integration tests will combine this threading pattern with real Azure operations.
+
