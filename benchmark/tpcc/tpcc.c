@@ -59,6 +59,8 @@ typedef struct {
   char *uri_container;
   char *uri_sas;
   char *uri_endpoint;
+  int cache_reuse;           /* --cache-reuse flag */
+  const char *cache_dir;     /* --cache-dir path */
   char uri_db_path[4096];  /* constructed URI string (large for encoded SAS) */
 } benchmark_config_t;
 
@@ -159,6 +161,8 @@ static void print_usage(const char *prog) {
   fprintf(stderr, "  --container NAME   Azure container name (with --uri)\n");
   fprintf(stderr, "  --sas TOKEN        SAS token (with --uri)\n");
   fprintf(stderr, "  --endpoint URL     Custom endpoint, e.g. Azurite (with --uri)\n");
+  fprintf(stderr, "  --cache-reuse      Reuse cached blob data across connections (with --uri)\n");
+  fprintf(stderr, "  --cache-dir DIR    Directory for blob cache files (with --uri)\n");
   fprintf(stderr, "  --wal              Enable WAL journal mode (default)\n");
   fprintf(stderr, "  --warehouses N     Number of warehouses (default: 1)\n");
   fprintf(stderr, "  --duration S       Benchmark duration in seconds (default: 60)\n");
@@ -614,6 +618,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Warning: multi-threading not yet implemented, using 1 thread\n");
         config.num_threads = 1;
       }
+    } else if (strcmp(argv[i], "--cache-reuse") == 0) {
+      config.cache_reuse = 1;
+    } else if (strcmp(argv[i], "--cache-dir") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Error: --cache-dir requires an argument\n");
+        return 1;
+      }
+      config.cache_dir = argv[i];
     } else if (strcmp(argv[i], "--reload") == 0) {
       config.force_reload = 1;
     } else if (strcmp(argv[i], "--wal") == 0) {
@@ -664,9 +676,23 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: failed to encode endpoint\n");
         return 1;
       }
-      snprintf(config.uri_db_path + n, sizeof(config.uri_db_path) - (size_t)n,
-               "&azure_endpoint=%s", enc_endpoint);
+      n += snprintf(config.uri_db_path + n, sizeof(config.uri_db_path) - (size_t)n,
+                    "&azure_endpoint=%s", enc_endpoint);
       free(enc_endpoint);
+    }
+    if (config.cache_reuse) {
+      n += snprintf(config.uri_db_path + n, sizeof(config.uri_db_path) - (size_t)n,
+                    "&cache_reuse=1");
+    }
+    if (config.cache_dir) {
+      char *enc_cache_dir = uri_encode_query_value(config.cache_dir);
+      if (!enc_cache_dir) {
+        fprintf(stderr, "Error: failed to encode cache_dir\n");
+        return 1;
+      }
+      n += snprintf(config.uri_db_path + n, sizeof(config.uri_db_path) - (size_t)n,
+                    "&cache_dir=%s", enc_cache_dir);
+      free(enc_cache_dir);
     }
     config.db_path = config.uri_db_path;
   } else if (config.use_azure) {
