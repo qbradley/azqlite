@@ -1449,11 +1449,31 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                     return rc;
                 }
 
-                azure_buffer_t buf = {0};
                 azure_error_init(&aerr);
-                arc = p->ops->page_blob_read(p->ops_ctx, zName,
-                                              0, (size_t)blobSize,
-                                              &buf, &aerr);
+
+                /* Use parallel chunked download when available */
+                if (p->ops->page_blob_read_multi) {
+                    arc = p->ops->page_blob_read_multi(
+                        p->ops_ctx, zName, blobSize,
+                        p->aData, &aerr);
+                    if (arc == AZURE_OK) {
+                        p->nData = blobSize;
+                    }
+                } else {
+                    /* Fallback: single-stream download */
+                    azure_buffer_t buf = {0};
+                    arc = p->ops->page_blob_read(p->ops_ctx, zName,
+                                                  0, (size_t)blobSize,
+                                                  &buf, &aerr);
+                    if (arc == AZURE_OK && buf.data && buf.size > 0) {
+                        sqlite3_int64 copyLen = (sqlite3_int64)buf.size;
+                        if (copyLen > blobSize) copyLen = blobSize;
+                        memcpy(p->aData, buf.data, (size_t)copyLen);
+                        p->nData = copyLen;
+                    }
+                    free(buf.data);
+                }
+
                 if (arc != AZURE_OK) {
                     free(p->aData);
                     p->aData = NULL;
@@ -1463,15 +1483,6 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                     p->zBlobName = NULL;
                     return azureErrToSqlite(arc, SQLITE_CANTOPEN);
                 }
-
-                /* Copy downloaded data into our buffer */
-                if (buf.data && buf.size > 0) {
-                    sqlite3_int64 copyLen = (sqlite3_int64)buf.size;
-                    if (copyLen > blobSize) copyLen = blobSize;
-                    memcpy(p->aData, buf.data, (size_t)copyLen);
-                    p->nData = copyLen;
-                }
-                free(buf.data);
 
                 /* Detect page size from header */
                 int detected = detectPageSize(p->aData, p->nData);

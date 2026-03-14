@@ -799,8 +799,10 @@ static azure_ops_t mock_ops = {
     .lease_renew        = mock_lease_renew_impl,
     .lease_release      = mock_lease_release_impl,
     .lease_break        = mock_lease_break_impl,
-    /* Batch write — not implemented in mock (Phase 2) */
+    /* Batch write — not implemented in mock */
     .page_blob_write_batch = NULL,
+    /* Parallel read — not implemented in mock (falls back to single read) */
+    .page_blob_read_multi = NULL,
     /* Append blob — WAL mode */
     .append_blob_create = mock_append_blob_create_impl,
     .append_blob_append = mock_append_blob_append_impl,
