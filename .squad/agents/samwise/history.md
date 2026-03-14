@@ -197,3 +197,102 @@ Completed Layer 2 infrastructure: 75 integration test cases written against Azur
   - Mock context pattern: `uri_ctx`/`uri_ops` static context, independent of other test files.
   - Integration tests use Azurite well-known credentials and create/cleanup containers.
   - `integ_attach_cross_container` is resilient — if ATTACH via URI is unsupported, it logs a note and passes (documents known limitation).
+
+### ETag Cache Reuse Test Infrastructure (2026-07-25)
+
+- **Mock ETag support added** to `test/mock_azure_ops.{h,c}`:
+  - Added `char etag[128]` field to `mock_blob_t` struct
+  - Added `int next_etag_num` counter to mock context for auto-generation
+  - Updated `mock_page_blob_create()` to set initial ETag on blob creation
+  - Updated `mock_page_blob_write()` and `mock_block_blob_upload()` to update ETag on modification
+  - Updated `mock_blob_get_properties()` to populate `err->etag` field with blob's current ETag
+  - Added public API: `mock_set_blob_etag()` and `mock_get_blob_etag()` for test manipulation
+- **8 comprehensive cache reuse tests written** in `test/test_cache_reuse.c`:
+  1. `cache_preserved_on_clean_close` — Cache + .etag files persist after clean close
+  2. `cache_reused_on_reconnect` — Verify ETag match → no re-download (call count checks)
+  3. `cache_invalidated_on_blob_change` — External ETag change → triggers re-download
+  4. `cache_deleted_without_cache_reuse` — Default behavior (no cache_reuse=1) → cleanup
+  5. `cache_deleted_on_dirty_close` — Unsynced writes → cache NOT persisted
+  6. `deterministic_naming` — FNV-1a hash ensures same blob → same cache path
+  7. `missing_etag_file_triggers_redownload` — Missing .etag → re-download
+  8. `size_mismatch_triggers_redownload` — Corrupted cache (wrong size) → re-download
+- **Test structure:**
+  - Dedicated context: `g_cache_ctx` / `g_cache_ops` (avoids conflicts with other test suites)
+  - Temp directory per test run: `/tmp/sqlite-cache-test-{PID}`
+  - Helper: `build_expected_cache_path()` mirrors VFS FNV-1a naming logic
+  - Helpers: `file_exists()`, `file_size()` for cache file validation
+- **Files modified:**
+  - `test/test_main.c` — Added `#include "test_cache_reuse.c"` and `run_cache_reuse_tests()`
+  - `Makefile` — Added `test/test_cache_reuse.c` to dependency list
+  - `src/sqlite_objs_vfs.c` — Added `#include <pthread.h>` (pre-existing compilation bug fix)
+- **Known issue:** Tests compile but fail during URI-based database opens (SQLITE_CANTOPEN). Root cause: URI parameters (`azure_account`, `azure_container`) trigger `azure_client_create()` which fails in unit tests with stub client. **Solution needed:** Remove Azure URI params from cache tests — tests should use global mock ops only, not per-file URI config. Cache functionality (cache_dir, cache_reuse) doesn't require Azure params.
+- **Test approach:** Tests verify cache behavior via filesystem checks (cache file existence, ETag file contents) and mock call counting (`page_blob_read` called/not called based on cache hit/miss).
+
+
+## 2024-03-14: ETag Cache Reuse Tests & TCL Suite Research
+
+### Task 1: Fix ETag Cache Reuse Tests
+
+**Problem:** Test file `test/test_cache_reuse.c` had Azure account/container parameters in URIs, causing per-file Azure client creation failures in mock environment.
+
+**Actions Taken:**
+1. ✅ Removed `&azure_account=testacct&azure_container=testcont` from all 9 URIs in test file
+2. ✅ Fixed `mock_azure_ops.c` strncpy bug (missing source parameter)  
+3. ✅ Enhanced mock to return ETags on write operations:
+   - `page_blob_write`: Updates blob ETag and returns in `err->etag`
+   - `page_blob_create`: Sets ETag on creation and returns
+   - `blob_get_properties`: Already returned ETag correctly
+4. ✅ Fixed VFS to extract blob names from full URIs (before '?' character)
+5. ✅ Updated all Azure operation calls to use `p->zBlobName` instead of `zName`
+6. ✅ Added deterministic cache naming for CREATE path when `cache_reuse=1`
+7. ✅ Added ETag capture from `page_blob_create`
+
+**Current Status:** PARTIALLY COMPLETE
+- URI parameter fixes: ✅ Done
+- Mock ETag support: ✅ Done  
+- VFS blob name extraction: ✅ Done
+- Test execution: ⚠️ Tests still failing (7 of 8 failing)
+
+**Remaining Issue:**
+URI parameters (`cache_dir`, `cache_reuse`) are not being parsed by SQLite.
+Debug shows `cacheDir='NULL' cacheReuse=0` even though tests use SQLITE_OPEN_URI flag.
+Root cause unclear - needs investigation into SQLite URI parameter API usage.
+
+**Learnings:**
+1. SQLite URI parsing is complex - `sqlite3_uri_parameter()` requires careful setup
+2. When debugging VFS issues, check parameter extraction FIRST before diving into logic
+3. Mock operations must return metadata (ETags) in error structs, not just blob state
+4. Blob name extraction from URIs critical when using query parameters
+5. The VFS sees the full URI string initially but must parse properly for SQLite API
+
+### Task 2: SQLite TCL Test Suite Integration Research
+
+**Deliverable:** Created `research/tcl-test-integration.md`
+
+**Key Findings:**
+- Our autoconf package lacks TCL test suite (need full source tree)
+- 500+ tests available; integration feasible but needs setup time (2-4 hours)
+- Expected compatibility issues: file locking (POSIX vs leases), mmap, filesystem assumptions
+- High value for SQL correctness regression testing
+- Recommended phased approach: start with curated subset
+
+**Recommendation:** YES to integration, starting with ~100 critical SQL/transaction tests
+
+## Learnings
+
+### VFS Development
+- **URI parameter extraction requires SQLITE_OPEN_URI flag AND proper API usage** - just setting the flag isn't enough
+- **Mock Azure operations need complete metadata simulation** - ETags, properties, leases all affect VFS behavior
+- **Blob name vs URI distinction critical** - VFS receives full URI but must extract blob name for operations
+- **Cache preservation depends on multiple conditions** - ETag presence, dirty page state, cacheReuse flag all matter
+
+### Testing Strategy  
+- **Integration tests reveal API misunderstandings** - unit tests passed but integration exposed URI parsing issue
+- **Debug strategically** - add targeted debug at boundaries (xOpen entry, parameter extraction, cache preservation decision)
+- **Test infrastructure matters** - fixing test_cache_reuse.c revealed both test AND implementation bugs
+
+### SQLite Ecosystem
+- **Autoconf vs full source** - amalgamation good for building, full source needed for comprehensive testing
+- **TCL test suite is the gold standard** - 500+ tests covering edge cases we'd never think of
+- **VFS compatibility is a spectrum** - some tests will fail due to fundamental differences (locking model), others should pass
+
