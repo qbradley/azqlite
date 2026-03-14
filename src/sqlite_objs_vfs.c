@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 
 /* ===================================================================
 ** Debug timing — opt-in via SQLITE_OBJS_DEBUG_TIMING=1 environment variable
@@ -138,8 +139,9 @@ typedef struct sqliteObjsFile {
     /* R2: Skip redundant resize — track last synced blob size */
     sqlite3_int64 lastSyncedSize;       /* Blob size after last successful resize/open */
 
-    /* ETag tracking (preparation for MVP 2 cache invalidation) */
+    /* ETag tracking for cache invalidation */
     char etag[128];                     /* Current blob ETag */
+    int cacheReuse;                     /* 1 = persistent cache with ETag validation */
 
     /* File type */
     int eFileType;                      /* SQLITE_OPEN_MAIN_DB, etc. */
@@ -303,6 +305,18 @@ static int dirtyEnsureCapacity(sqliteObjsFile *p) {
     return SQLITE_OK;
 }
 
+/*
+** Check if any dirty bits are set in the bitmap.
+** Returns 1 if any page is dirty, 0 if all clean.
+*/
+static int dirtyHasAny(sqliteObjsFile *p) {
+    if (!p->aDirty) return 0;
+    for (int i = 0; i < p->nDirtyAlloc; i++) {
+        if (p->aDirty[i]) return 1;
+    }
+    return 0;
+}
+
 
 /* ===================================================================
 ** Helper: cache file management for MAIN_DB
@@ -327,6 +341,82 @@ static int cacheEnsureSize(sqliteObjsFile *p, sqlite3_int64 newSize) {
     }
     
     return dirtyEnsureCapacity(p);
+}
+
+/* ===================================================================
+** Helper: ETag sidecar file operations for cache reuse
+** =================================================================== */
+
+/*
+** Build the ETag sidecar path from a cache path: replace .cache with .etag
+** Returns heap-allocated string.  Caller must free().
+*/
+static char *buildEtagPath(const char *cachePath) {
+    if (!cachePath) return NULL;
+    size_t len = strlen(cachePath);
+    const char *suffix = ".cache";
+    size_t suffixLen = 6;
+    if (len >= suffixLen && strcmp(cachePath + len - suffixLen, suffix) == 0) {
+        size_t baseLen = len - suffixLen;
+        char *path = (char *)malloc(baseLen + 6);  /* ".etag\0" */
+        if (!path) return NULL;
+        memcpy(path, cachePath, baseLen);
+        memcpy(path + baseLen, ".etag", 6);
+        return path;
+    }
+    /* Fallback: append .etag */
+    char *path = (char *)malloc(len + 6);
+    if (!path) return NULL;
+    memcpy(path, cachePath, len);
+    memcpy(path + len, ".etag", 6);
+    return path;
+}
+
+/*
+** Read stored ETag from sidecar file.
+** Returns 0 on success with buf filled, -1 on failure.
+*/
+static int readEtagFile(const char *path, char *buf, size_t bufSize) {
+    if (!path || !buf || bufSize == 0) return -1;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, bufSize - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r' || buf[n-1] == ' '))
+        n--;
+    buf[n] = '\0';
+    return 0;
+}
+
+/*
+** Write ETag to sidecar file derived from cachePath (.cache → .etag).
+** Returns 0 on success, -1 on failure.
+*/
+static int writeEtagFile(const char *cachePath, const char *etag) {
+    if (!cachePath || !etag || !etag[0]) return -1;
+    char *etagPath = buildEtagPath(cachePath);
+    if (!etagPath) return -1;
+    int fd = open(etagPath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) { free(etagPath); return -1; }
+    size_t len = strlen(etag);
+    ssize_t nw = write(fd, etag, len);
+    fsync(fd);
+    close(fd);
+    free(etagPath);
+    return (nw == (ssize_t)len) ? 0 : -1;
+}
+
+/*
+** Remove the ETag sidecar file corresponding to a cache path.
+*/
+static void unlinkEtagFile(const char *cachePath) {
+    if (!cachePath) return;
+    char *etagPath = buildEtagPath(cachePath);
+    if (etagPath) {
+        unlink(etagPath);
+        free(etagPath);
+    }
 }
 
 /*
@@ -504,13 +594,21 @@ static int sqliteObjsClose(sqlite3_file *pFile) {
         p->leaseId[0] = '\0';
     }
 
-    /* Close and delete cache file for MAIN_DB */
+    /* Close and conditionally delete cache file for MAIN_DB */
     if (p->cacheFd >= 0) {
         close(p->cacheFd);
         p->cacheFd = -1;
     }
     if (p->zCachePath) {
-        unlink(p->zCachePath);
+        if (p->cacheReuse && p->etag[0] != '\0' && !dirtyHasAny(p)) {
+            /* Cache is clean and we have a valid ETag — persist for reuse */
+            writeEtagFile(p->zCachePath, p->etag);
+            /* DON'T unlink the cache file */
+        } else {
+            /* Default behavior: clean up */
+            unlink(p->zCachePath);
+            unlinkEtagFile(p->zCachePath);
+        }
         free(p->zCachePath);
         p->zCachePath = NULL;
     }
@@ -1477,6 +1575,60 @@ static char *buildCacheTemplate(const char *cacheDir) {
     return strdup("/tmp/sqlite-objs-XXXXXX");
 }
 
+/* ===================================================================
+** ETag-based cache reuse helpers
+** =================================================================== */
+
+/*
+** FNV-1a hash — fast non-cryptographic hash for cache path naming.
+*/
+static uint64_t fnv1a_hash(const char *data, size_t len) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)(unsigned char)data[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+/*
+** Build a deterministic cache file path from blob identity.
+** Returns heap-allocated string: {cacheDir}/sqlite-objs-{hex}.cache
+** Caller must free().  Returns NULL on allocation failure.
+*/
+static char *buildCachePath(const char *cacheDir, const char *account,
+                            const char *container, const char *blobName) {
+    if (!cacheDir || !cacheDir[0]) cacheDir = "/tmp";
+    mkdir(cacheDir, 0700);  /* ignore EEXIST */
+
+    /* Hash "account:container:blobName" */
+    size_t aLen = account ? strlen(account) : 0;
+    size_t cLen = container ? strlen(container) : 0;
+    size_t bLen = blobName ? strlen(blobName) : 0;
+    size_t keyLen = aLen + 1 + cLen + 1 + bLen;
+    char *key = (char *)malloc(keyLen + 1);
+    if (!key) return NULL;
+    snprintf(key, keyLen + 1, "%s:%s:%s",
+             account ? account : "",
+             container ? container : "",
+             blobName ? blobName : "");
+    uint64_t h = fnv1a_hash(key, keyLen);
+    free(key);
+
+    char hex[17];
+    snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)h);
+
+    size_t dirLen = strlen(cacheDir);
+    if (dirLen > 0 && cacheDir[dirLen - 1] == '/') dirLen--;
+
+    /* "{dir}/sqlite-objs-{16hex}.cache\0" */
+    size_t pathLen = dirLen + 1 + 12 + 16 + 6 + 1;
+    char *path = (char *)malloc(pathLen);
+    if (!path) return NULL;
+    snprintf(path, pathLen, "%.*s/sqlite-objs-%s.cache", (int)dirLen, cacheDir, hex);
+    return path;
+}
+
 /*
 ** Parse Azure URI parameters from a sqlite3_filename.
 ** Returns 1 if azure_account is present (config populated), 0 otherwise.
@@ -1566,9 +1718,11 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
     p->pageSize = SQLITE_OBJS_DEFAULT_PAGE_SIZE;
     p->cacheFd = -1;  /* Initialize cache fd */
     p->zCachePath = NULL;
+    p->cacheReuse = 0;
 
-    /* Read optional cache_dir URI parameter (only valid for MAIN_DB) */
+    /* Read optional cache_dir and cache_reuse URI parameters */
     const char *cacheDir = sqlite3_uri_parameter(zName, "cache_dir");
+    int cacheReuse = sqlite3_uri_boolean(zName, "cache_reuse", 0);
 
     if (isMainDb) {
         /* MAIN_DB → Azure page blob */
@@ -1603,22 +1757,79 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 memcpy(p->etag, aerr.etag, sizeof(p->etag));
             }
 
-            /* Create cache file */
-            char *cacheTemplate = buildCacheTemplate(cacheDir);
-            if (!cacheTemplate) {
-                sqlite3_free(p->zBlobName);
-                p->zBlobName = NULL;
-                return SQLITE_NOMEM;
-            }
-            p->cacheFd = mkstemp(cacheTemplate);
-            if (p->cacheFd < 0) {
-                free(cacheTemplate);
-                sqlite3_free(p->zBlobName);
-                p->zBlobName = NULL;
-                return SQLITE_CANTOPEN;
-            }
-            p->zCachePath = cacheTemplate;  /* mkstemp modified it in place */
+            /* ETag-based cache reuse: try to reuse existing cache file */
+            if (cacheReuse && blobSize > 0) {
+                const char *acct = sqlite3_uri_parameter(zName, "azure_account");
+                const char *cont = sqlite3_uri_parameter(zName, "azure_container");
+                char *cachePath = buildCachePath(cacheDir, acct, cont, zName);
+                if (cachePath) {
+                    char *etagPath = buildEtagPath(cachePath);
+                    char storedEtag[128] = {0};
+                    if (etagPath &&
+                        readEtagFile(etagPath, storedEtag, sizeof(storedEtag)) == 0 &&
+                        p->etag[0] != '\0' &&
+                        strcmp(storedEtag, p->etag) == 0) {
+                        /* ETag match — try to reuse cache file */
+                        int fd = open(cachePath, O_RDWR);
+                        if (fd >= 0) {
+                            /* Verify cached file size matches blob */
+                            off_t cachedSize = lseek(fd, 0, SEEK_END);
+                            if (cachedSize == (off_t)blobSize) {
+                                p->cacheFd = fd;
+                                p->zCachePath = cachePath;
+                                p->cacheReuse = 1;
+                                p->nData = blobSize;
 
+                                /* Detect page size from header */
+                                unsigned char header[100];
+                                ssize_t nRead = pread(p->cacheFd, header, sizeof(header), 0);
+                                if (nRead == (ssize_t)sizeof(header)) {
+                                    int detected = detectPageSize(header, sizeof(header));
+                                    if (detected > 0) p->pageSize = detected;
+                                }
+                                dirtyEnsureCapacity(p);
+                                p->lastSyncedSize = p->nData;
+                                free(etagPath);
+                                goto cache_ready;
+                            }
+                            close(fd);
+                        }
+                    }
+                    free(etagPath);
+                    /* Cache miss — use deterministic name for fresh download */
+                    p->cacheFd = open(cachePath, O_RDWR | O_CREAT | O_TRUNC, 0600);
+                    if (p->cacheFd < 0) {
+                        free(cachePath);
+                        sqlite3_free(p->zBlobName);
+                        p->zBlobName = NULL;
+                        return SQLITE_CANTOPEN;
+                    }
+                    p->zCachePath = cachePath;
+                    p->cacheReuse = 1;
+                    goto cache_download;
+                }
+                /* buildCachePath failed — fall through to mkstemp path */
+            }
+
+            /* Create cache file (default: random mkstemp name) */
+            {
+                char *cacheTemplate = buildCacheTemplate(cacheDir);
+                if (!cacheTemplate) {
+                    sqlite3_free(p->zBlobName);
+                    p->zBlobName = NULL;
+                    return SQLITE_NOMEM;
+                }
+                p->cacheFd = mkstemp(cacheTemplate);
+                if (p->cacheFd < 0) {
+                    free(cacheTemplate);
+                    sqlite3_free(p->zBlobName);
+                    p->zBlobName = NULL;
+                    return SQLITE_CANTOPEN;
+                }
+                p->zCachePath = cacheTemplate;
+            }
+
+            cache_download:
             if (blobSize > 0) {
                 /* Download to temporary buffer, then write to cache file */
                 unsigned char *tempBuf = (unsigned char *)malloc(blobSize);
@@ -1730,6 +1941,7 @@ static int sqliteObjsOpen(sqlite3_vfs *pVfs, sqlite3_filename zName,
                 /* Empty blob */
                 p->nData = 0;
             }
+            cache_ready: ;  /* ETag cache hit jumps here */
         } else if (!blobExists && (flags & SQLITE_OPEN_CREATE)) {
             /* Create new page blob */
             if (p->ops && p->ops->page_blob_create) {

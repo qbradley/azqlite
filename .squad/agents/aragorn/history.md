@@ -421,3 +421,48 @@ Likely cause: Edge case in blob download or cache file initialization during reo
 ### Memory impact
 Expected reduction: database file size (can be GBs) → ~8MB (SQLite page cache). Cache file on disk instead.
 
+
+## 2025-07-25: Added `cache_dir` URI parameter for cache file location
+
+### Context
+User requested the ability to control where VFS cache files are placed, instead of always using `/tmp`.
+
+### Changes
+**src/sqlite_objs_vfs.c:**
+- Added `#include <errno.h>` and `#include <sys/stat.h>`
+- Added `buildCacheTemplate(cacheDir)` helper: builds a heap-allocated mkstemp template under the given directory (creating it with `mkdir(..., 0700)` if needed), falling back to `/tmp/sqlite-objs-XXXXXX`
+- In `sqliteObjsOpen`: parse `cache_dir` via `sqlite3_uri_parameter(zName, "cache_dir")` before the `isMainDb` branch
+- Replaced both mkstemp call sites (existing blob download + new blob creation) to use `buildCacheTemplate(cacheDir)` instead of stack-allocated `/tmp/sqlite-objs-XXXXXX` + `strdup()`
+- The heap-allocated template is assigned directly to `p->zCachePath` after mkstemp (no extra strdup needed)
+
+**src/sqlite_objs.h:**
+- Added `cache_dir` to the URI parameter documentation list
+
+### Usage
+```
+file:mydb.db?cache_dir=/var/cache/myapp
+```
+
+### Test results
+- Build: clean, no warnings
+- All 242 unit tests pass
+
+### ETag-Based Cache Reuse Implementation
+
+**Files modified:**
+- `src/sqlite_objs_vfs.c` — Added `cacheReuse` field to `sqliteObjsFile`, new URI parameter `cache_reuse`, conditional xOpen/xClose logic, 7 helper functions
+- `src/sqlite_objs.h` — Added `cache_reuse` to URI parameter documentation
+
+**Key implementation details:**
+- **Opt-in via `cache_reuse=1` URI parameter.** Default behavior (mkstemp + unlink on close) is unchanged.
+- **FNV-1a hash** of `account:container:blobName` produces deterministic cache path: `{cache_dir}/sqlite-objs-{16hex}.cache`
+- **ETag sidecar** at `.etag` extension (same base name). Written on clean close, read on next open.
+- **Cache reuse flow:** xOpen reads blob properties (already happening) → checks stored ETag vs live ETag → if match AND cache file exists with correct size → skip download entirely.
+- **Cache miss:** falls through to normal download but uses deterministic path instead of mkstemp.
+- **xClose logic:** If `cacheReuse=1` AND etag present AND no dirty pages → write ETag sidecar, preserve cache file. Otherwise → unlink both.
+- **Safety:** If process crashes between xWrite and xSync, dirty pages exist. On next open, no ETag sidecar exists (wasn't written) → full download. Crash-safe by design.
+- Helper functions placed before xClose to avoid forward declaration issues with C99 strict mode.
+
+### Test results
+- Build: clean, no warnings
+- All 242 unit tests pass, zero regressions
